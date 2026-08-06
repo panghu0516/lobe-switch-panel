@@ -9,6 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 const https = require('https');
 const speakeasy = require('speakeasy');
+const QRCode = require('qrcode');
 
 /* ================= 环境变量 ================= */
 const PORT = process.env.PORT || 3000;
@@ -160,20 +161,22 @@ function requireTotp(req, res, next) {
   return res.redirect('/totp/verify');             // 需验证
 }
 
-/* TOTP 设置页：未配置 secret 时生成并展示绑定 URI */
-app.get('/totp/setup', (req, res) => {
+/* TOTP 设置页：未配置 secret 时生成并展示绑定 URI（含二维码） */
+app.get('/totp/setup', async (req, res) => {
   if (TOTP_SECRET) {
-    return res.status(200).send('<h3>TOTP 已启用</h3><p>如需重新绑定，请在 Sealos 环境变量中更换 TOTP_SECRET 后重新部署。</p>');
+    return res.status(200).send('<!DOCTYPE html><html><head><meta charset="utf-8"><title>TOTP 已启用</title></head><body style="background:#0f1115;color:#e6e8eb;font-family:system-ui;text-align:center;padding-top:60px"><h3>🔐 TOTP 已启用</h3><p>如需重新绑定，请在 Sealos 环境变量中<b>更换 TOTP_SECRET</b> 并重新部署。</p><p style="color:#8b949e;font-size:13px">⚠️ 更换后需在 Authenticator 中重新扫码绑定新密钥。</p></body></html>');
   }
   const sec = speakeasy.generateSecret({ name: 'LobeSwitch', issuer: 'LobeSwitch' });
   const uri = sec.otpauth_url;
+  const qr = await QRCode.toDataURL(uri);
   res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>绑定TOTP</title>
-<style>body{font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:0 16px;background:#0f1115;color:#e6e8eb}h1{font-size:20px}code{display:block;background:#1c2128;padding:10px;border-radius:6px;word-break:break-all;font-size:12px;color:#79c0ff}.btn{display:inline-block;margin-top:16px;padding:12px 24px;background:#2ea043;color:#fff;text-decoration:none;border-radius:8px}</style></head>
+<style>body{font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:0 16px;background:#0f1115;color:#e6e8eb}h1{font-size:20px}code{display:block;background:#1c2128;padding:10px;border-radius:6px;word-break:break-all;font-size:12px;color:#79c0ff}.btn{display:inline-block;margin-top:16px;padding:12px 24px;background:#2ea043;color:#fff;text-decoration:none;border-radius:8px}.qr{background:#fff;padding:12px;border-radius:8px;display:inline-block;margin:12px 0}</style></head>
 <body><h1>🔐 绑定动态验证码</h1>
-<p>请用 <b>微软 Authenticator</b>（或 Google Authenticator）扫码，或手动输入密钥：</p>
-<code>${sec.base32}</code>
-<p style="color:#8b949e;font-size:13px">绑定后，请将此密钥填入 Sealos 环境变量 <b>TOTP_SECRET</b> 并重新部署。</p>
-<p style="color:#d29922;font-size:13px">⚠️ 密钥仅显示本次，填错需重新生成。</p>
+<p>请用 <b>微软 Authenticator</b>（或 Google Authenticator）<b>扫码下方二维码</b>：</p>
+<div class="qr"><img src="${qr}" alt="QR Code" style="width:220px;height:220px"></div>
+<br>或手动输入密钥：<code>${sec.base32}</code>
+<p style="color:#8b949e;font-size:13px">扫码后 Authenticator 会出现一个 <b>6 位</b>动态码。<br>绑定后，请将此密钥填入 Sealos 环境变量 <b>TOTP_SECRET</b> 并重新部署。</p>
+<p style="color:#d29922;font-size:13px">⚠️ 密钥仅显示本次，请先记下再刷新页面。</p>
 <div><a class="btn" href="/auth/login">我已绑定，去登录</a></div></body></html>`);
 });
 
