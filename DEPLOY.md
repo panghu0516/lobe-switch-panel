@@ -36,6 +36,16 @@ kubectl apply -f rbac.yaml
 kubectl create token lobe-switch-sa -n ns-feotrwac --duration=8760h
 ```
 
+### 2.4 RBAC 权限预检（必须带资源名，否则恒返回 no）
+```bash
+kubectl get sa,role,rolebinding -n ns-feotrwac | grep lobe-switch
+kubectl auth can-i patch statefulsets/scale lobehub-v2 --as=system:serviceaccount:ns-feotrwac:lobe-switch-sa -n ns-feotrwac
+kubectl auth can-i get statefulsets lobehub-v2 --as=system:serviceaccount:ns-feotrwac:lobe-switch-sa -n ns-feotrwac
+kubectl auth can-i patch deployments/scale device-gateway --as=system:serviceaccount:ns-feotrwac:lobe-switch-sa -n ns-feotrwac
+kubectl auth can-i get deployments device-gateway --as=system:serviceaccount:ns-feotrwac:lobe-switch-sa -n ns-feotrwac
+```
+预期全部 yes。老版本 kubectl 报错时改用 `--subresource=scale` 语法。
+
 ## 3. 环境变量清单（Sealos 填）
 
 ### 第一批（现在填，8 个）
@@ -81,3 +91,7 @@ GITHUB_CALLBACK_URL = https://<面板域名>/auth/callback
 - 不要用 Sealos"启动命令"传参，一切靠环境变量
 - 每次暂停前确认无重要会话在跑（破坏性操作）
 - KUBE_SA_TOKEN 和 GITHUB_CLIENT_SECRET 绝不进代码仓库/日志
+- TLS：集群内访问 API server 需处理内部 CA，代码已自动适配（启动日志打印 `[kube] TLS: ...`）
+- can-i 预检带 resourceNames 规则必须带资源名，否则恒返回 no
+- `Warning: auto-generated secret-based tokens` 是无害提示
+- 登录一次 7 天免登录属正常设计
