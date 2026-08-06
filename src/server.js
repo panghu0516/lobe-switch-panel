@@ -7,6 +7,7 @@ const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const https = require('https');
 
 /* ================= 环境变量 ================= */
 const PORT = process.env.PORT || 3000;
@@ -20,6 +21,21 @@ const KUBE_SA_TOKEN = process.env.KUBE_SA_TOKEN || '';
 const KUBE_NAMESPACE = process.env.KUBE_NAMESPACE || 'default';
 const APPS_CONFIG = parseApps(process.env.APPS_CONFIG || '[]');
 const STATE_FILE = process.env.STATE_FILE || '/data/state.json';
+
+/* ================= K8s TLS Agent =================
+ * 集群内 API server 用内部 CA 签发证书：
+ * 1) 优先使用 Pod 内挂载的 CA 证书（安全）
+ * 2) 未挂载则跳过 TLS 校验（仅限集群内地址，无中间人风险）
+ */
+const KUBE_CA_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt';
+let kubeAgent;
+if (fs.existsSync(KUBE_CA_PATH)) {
+  kubeAgent = new https.Agent({ ca: fs.readFileSync(KUBE_CA_PATH) });
+  console.log('[kube] TLS: 使用集群内 CA 证书 ' + KUBE_CA_PATH);
+} else {
+  kubeAgent = new https.Agent({ rejectUnauthorized: false });
+  console.log('[kube] TLS: 未找到集群 CA，跳过证书校验（仅限集群内通信）');
+}
 
 /* ================= 工具函数 ================= */
 function parseApps(str) {
@@ -62,7 +78,9 @@ function kubeUrl(kind, name, sub) {
 
 async function kubeGet(kind, name) {
   const res = await fetch(kubeUrl(kind, name), {
-    headers: { Authorization: `Bearer ${KUBE_SA_TOKEN}`, Accept: 'application/json' }
+    headers: { Authorization: `Bearer ${KUBE_SA_TOKEN}`, Accept: 'application/json' },
+    agent: kubeAgent,
+    timeout: 10000
   });
   if (!res.ok) throw new Error(`GET ${name}: ${res.status} ${await safeBody(res)}`);
   const data = await res.json();
@@ -76,7 +94,9 @@ async function kubeScale(kind, name, replicas) {
       Authorization: `Bearer ${KUBE_SA_TOKEN}`,
       'Content-Type': 'application/merge-patch+json'
     },
-    body: JSON.stringify({ spec: { replicas: Number(replicas) } })
+    body: JSON.stringify({ spec: { replicas: Number(replicas) } }),
+    agent: kubeAgent,
+    timeout: 10000
   });
   if (!res.ok) throw new Error(`PATCH scale ${name}: ${res.status} ${await safeBody(res)}`);
   return res.json();
@@ -268,4 +288,7 @@ app.post('/resume', requireAuth, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`[lobe-switch] listening on :${PORT}`);
   console.log(`[lobe-switch] namespace=${KUBE_NAMESPACE} apps=${APPS_CONFIG.length}`);
+  if (!process.env.SESSION_SECRET) {
+    console.log('[warn] SESSION_SECRET 未设置，每次重启后需重新登录');
+  }
 });
