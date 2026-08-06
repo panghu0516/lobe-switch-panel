@@ -132,7 +132,9 @@ app.get('/', (req, res) => {
 <button class="logout" onclick="window.location='/logout'">退出</button>
 </div>
 <script>
-async function load(){const r=await fetch('/status');const s=await r.json();const list=document.getElementById('list');
+async function load(){const r=await fetch('/status');
+if(r.status===401){window.location='/auth/login';return;}
+const s=await r.json();const list=document.getElementById('list');
 const anyRunning=s && s.some(x=>x.running===true);
 list.innerHTML='<div class=card><div class=row><b>应用</b><b>副本</b><b>状态</b></div>'+s.map(x=>{
 const st=x.running===true?'<span class=running>运行中</span>':(x.running===false?'<span class=paused>已暂停</span>':'<span class=err>'+escapeHtml(x.error||'未知')+'</span>');
@@ -141,9 +143,11 @@ return '<div class=row><span>'+escapeHtml(x.name)+' ('+x.kind+')</span><span>'+x
 async function act(kind){const btn=document.querySelectorAll('button');btn.forEach(b=>b.disabled=true);
 const msg=document.getElementById('msg');
 if(kind==='pause' && !confirm('确认暂停全部服务？正在进行的会话将中断。')){btn.forEach(b=>b.disabled=false);return;}
-try{const r=await fetch('/'+kind,{method:'POST'});const s=await r.json();
+try{const r=await fetch('/'+kind,{method:'POST'});
+if(r.status===401){msg.style.color='#f85149';msg.textContent='⚠️ 登录已过期，正在跳转登录...';setTimeout(()=>window.location='/auth/login',800);return;}
+const s=await r.json();
 if(s && s.ok){msg.style.color='#3fb950';msg.textContent=(kind==='pause'?'✅ 已全部暂停':'✅ 已全部恢复');await load();}
-else{msg.style.color='#f85149';msg.textContent='操作失败: '+escapeHtml((s&&s.error)||'未知');}}
+else{msg.style.color='#f85149';msg.textContent='操作失败: '+escapeHtml((s&&s.error)||'HTTP '+r.status);}}
 catch(e){msg.style.color='#f85149';msg.textContent='请求错误: '+escapeHtml(e.message);}
 btn.forEach(b=>b.disabled=false);}
 window.onload=load;
@@ -155,6 +159,9 @@ function escapeHtml(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, m
 
 /* ---------- GitHub OAuth ---------- */
 app.get('/auth/login', (req, res) => {
+  if (!GITHUB_CLIENT_ID || !GITHUB_CALLBACK_URL) {
+    return res.status(500).send('<h3>GitHub OAuth 未配置</h3><p>请先在 Sealos 环境变量中设置 GITHUB_CLIENT_ID 和 GITHUB_CALLBACK_URL，然后重新部署。</p>');
+  }
   const state = crypto.randomBytes(16).toString('hex');
   req.session.oauthState = state;
   const params = new URLSearchParams({ client_id: GITHUB_CLIENT_ID, redirect_uri: GITHUB_CALLBACK_URL, scope: 'read:user', state });
@@ -189,7 +196,10 @@ app.get('/auth/callback', async (req, res) => {
 });
 
 app.get('/logout', (req, res) => {
-  req.session.destroy(() => res.redirect('/auth/login'));
+  req.session.destroy(() => {
+    res.clearCookie('connect.sid');
+    res.redirect('/auth/login');
+  });
 });
 
 /* ---------- 4 个业务端点 ---------- */
