@@ -196,7 +196,14 @@ app.get('/auth/login', (req, res) => {
   }
   const state = crypto.randomBytes(16).toString('hex');
   req.session.oauthState = state;
-  const params = new URLSearchParams({ client_id: GITHUB_CLIENT_ID, redirect_uri: GITHUB_CALLBACK_URL, scope: 'read:user', state });
+  const params = new URLSearchParams({
+    client_id: GITHUB_CLIENT_ID,
+    redirect_uri: GITHUB_CALLBACK_URL,
+    scope: 'read:user',
+    state,
+    prompt: 'consent',      // 每次授权都弹确认框（即使已授权过）
+    force_login: true        // 强制重新输入 GitHub 密码（即使浏览器已登录）
+  });
   res.redirect('https://github.com/login/oauth/authorize?' + params.toString());
 });
 
@@ -227,11 +234,25 @@ app.get('/auth/callback', async (req, res) => {
   }
 });
 
+/* favicon：返回 204，避免 404 刷屏 */
+app.get('/favicon.ico', (req, res) => res.status(204).end());
+
+/* 退出：清 cookie + 销毁 session，跳本地"已退出"页（不跳 GitHub，避免自动登回） */
 app.get('/logout', (req, res) => {
   req.session.destroy(() => {
     res.clearCookie('connect.sid');
-    res.redirect('/auth/login');
+    res.redirect('/logged-out');
   });
+});
+
+/* 已退出页：明确显示退出成功，刷新仍停留此页；点"重新登录"/访问面板才走 OAuth 重验 */
+app.get('/logged-out', (req, res) => {
+  res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>已退出</title>
+<style>body{font-family:system-ui,sans-serif;max-width:480px;margin:60px auto;padding:0 16px;background:#0f1115;color:#e6e8eb;text-align:center}h1{font-size:22px}.ok{color:#3fb950;font-size:44px}.btn{display:inline-block;margin-top:24px;padding:12px 28px;background:#2ea043;color:#fff;text-decoration:none;border-radius:8px;font-size:16px}.tip{color:#8b949e;font-size:14px;margin-top:16px}</style></head>
+<body><div class="ok">✓</div><h1>您已安全退出</h1>
+<p>登录状态已清除，刷新本页仍停留在退出状态。</p>
+<a class="btn" href="/auth/login">重新登录</a>
+<div class="tip">重新登录需输入 GitHub 密码 + 动态验证码</div></body></html>`);
 });
 
 /* ---------- 4 个业务端点 ---------- */
