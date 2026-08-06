@@ -24,6 +24,7 @@ const KUBE_NAMESPACE = process.env.KUBE_NAMESPACE || 'default';
 const APPS_CONFIG = parseApps(process.env.APPS_CONFIG || '[]');
 const STATE_FILE = process.env.STATE_FILE || '/data/state.json';
 const TOTP_SECRET = process.env.TOTP_SECRET || '';   // 可为空，首次通过 /totp/setup 生成并注入
+const AUTH_MODE = (process.env.AUTH_MODE || 'both').toLowerCase(); // github | totp | both（空/未知 => 拒绝访问）
 
 /* ================= K8s TLS Agent =================
  * 集群内 API server 用内部 CA 签发证书：
@@ -144,7 +145,21 @@ app.use((req, res, next) => {
   next();
 });
 
+function authModeOk() {
+  if (AUTH_MODE === 'totp') return !!TOTP_SECRET;                 // 只要动态码：必须已配置 TOTP_SECRET
+  if (AUTH_MODE === 'github') return true;                        // 只要 GitHub
+  if (AUTH_MODE === 'both') return true;                          // 两者都要
+  return false;                                                    // 未知模式 => 拒绝访问
+}
+
 function requireAuth(req, res, next) {
+  if (!authModeOk()) return res.status(503).send('认证模式未配置或无效，禁止访问');
+  if (AUTH_MODE === 'totp') {
+    // 只要动态码：动态码已验证即放行，不要求 GitHub
+    if (req.session && req.session.totpVerified) return next();
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  // github / both：要求 GitHub 登录
   if (req.session && req.session.user) return next();
   return res.status(401).json({ error: 'unauthorized' });
 }
@@ -210,16 +225,19 @@ app.post('/totp/verify', (req, res) => {
 
 /* ---------- 前端页面 ---------- */
 app.get('/', (req, res) => {
-  if (!req.session || !req.session.user) {
-    return res.redirect('/auth/login');
-  }
-  if (TOTP_SECRET && !req.session.totpVerified) {
-    return res.redirect('/totp/verify');
+  if (!authModeOk()) return res.status(503).send('认证模式未配置或无效，禁止访问');
+  if (AUTH_MODE === 'totp') {
+    // 只要动态码：未验证则跳动态码页
+    if (!req.session || !req.session.totpVerified) return res.redirect('/totp/verify');
+  } else {
+    // github / both：先要求 GitHub 登录
+    if (!req.session || !req.session.user) return res.redirect('/auth/login');
+    if (TOTP_SECRET && !req.session.totpVerified) return res.redirect('/totp/verify');
   }
   res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lobe 开关控制面板</title>
 <style>body{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;background:#0f1115;color:#e6e8eb}h1{font-size:22px}button{font-size:16px;padding:12px 20px;border:none;border-radius:8px;cursor:pointer;margin:8px 8px 8px 0}.pause{background:#d64545;color:#fff}.resume{background:#2ea043;color:#fff}.logout{background:#333;color:#ccc}.card{background:#1c2128;padding:16px;border-radius:10px;margin:12px 0}.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2a2f38}.running{color:#3fb950}.paused{color:#f85149}.err{color:#d29922}</style></head>
 <body><h1>🔌 Lobe 一键开关</h1>
-<p>已登录：<b>${escapeHtml(req.session.user.login)}</b></p>
+<p>已验证：<b>${escapeHtml(AUTH_MODE === 'totp' ? '动态码' : (req.session.user ? req.session.user.login : ''))}</b></p>
 <div id="msg" style="margin:8px 0;font-weight:bold"></div>
 <div id="list"></div>
 <div>
@@ -228,8 +246,9 @@ app.get('/', (req, res) => {
 <button class="logout" onclick="window.location='/logout'">退出</button>
 </div>
 <script>
+const LOGIN_URL='${AUTH_MODE === 'totp' ? '/totp/verify' : '/auth/login'}';
 async function load(){const r=await fetch('/status');
-if(r.status===401){window.location='/auth/login';return;}
+if(r.status===401){window.location=LOGIN_URL;return;}
 const s=await r.json();const list=document.getElementById('list');
 const apps=(s&&s.apps)||[];
 const anyErr=apps.length===0;
@@ -242,7 +261,7 @@ async function act(kind){const btn=document.querySelectorAll('button');btn.forEa
 const msg=document.getElementById('msg');
 if(kind==='pause' && !confirm('确认暂停全部服务？正在进行的会话将中断。')){btn.forEach(b=>b.disabled=false);return;}
 try{const r=await fetch('/'+kind,{method:'POST'});
-if(r.status===401){msg.style.color='#f85149';msg.textContent='⚠️ 登录已过期，正在跳转登录...';setTimeout(()=>window.location='/auth/login',800);return;}
+if(r.status===401){msg.style.color='#f85149';msg.textContent='⚠️ 登录已过期，正在跳转登录...';setTimeout(()=>window.location=LOGIN_URL,800);return;}
 const s=await r.json();
 if(s && s.ok){msg.style.color='#3fb950';msg.textContent=(kind==='pause'?'✅ 已全部暂停':'✅ 已全部恢复');await load();}
 else if(s&&s.errors&&s.errors.length){msg.style.color='#f85149';msg.textContent='部分失败: '+escapeHtml(s.errors.join(' | '));}
@@ -322,8 +341,8 @@ app.get('/logged-out', (req, res) => {
 <style>body{font-family:system-ui,sans-serif;max-width:480px;margin:60px auto;padding:0 16px;background:#0f1115;color:#e6e8eb;text-align:center}h1{font-size:22px}.ok{color:#3fb950;font-size:44px}.btn{display:inline-block;margin-top:24px;padding:12px 28px;background:#2ea043;color:#fff;text-decoration:none;border-radius:8px;font-size:16px}.tip{color:#8b949e;font-size:14px;margin-top:16px}</style></head>
 <body><div class="ok">✓</div><h1>您已安全退出</h1>
 <p>登录状态已清除，刷新本页仍停留在退出状态。</p>
-<a class="btn" href="/auth/login">重新登录</a>
-<div class="tip">重新登录需输入 GitHub 密码 + 动态验证码</div></body></html>`);
+<a class="btn" href="${AUTH_MODE === 'totp' ? '/totp/verify' : '/auth/login'}">重新登录</a>
+<div class="tip">${AUTH_MODE === 'totp' ? '重新登录需输入动态验证码' : '重新登录需输入 GitHub 密码 + 动态验证码'}</div></body></html>`);
 });
 
 /* ---------- 4 个业务端点 ---------- */
