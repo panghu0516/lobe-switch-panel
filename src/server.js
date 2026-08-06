@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const https = require('https');
+const speakeasy = require('speakeasy');
 
 /* ================= 环境变量 ================= */
 const PORT = process.env.PORT || 3000;
@@ -21,6 +22,7 @@ const KUBE_SA_TOKEN = process.env.KUBE_SA_TOKEN || '';
 const KUBE_NAMESPACE = process.env.KUBE_NAMESPACE || 'default';
 const APPS_CONFIG = parseApps(process.env.APPS_CONFIG || '[]');
 const STATE_FILE = process.env.STATE_FILE || '/data/state.json';
+const TOTP_SECRET = process.env.TOTP_SECRET || '';   // 可为空，首次通过 /totp/setup 生成并注入
 
 /* ================= K8s TLS Agent =================
  * 集群内 API server 用内部 CA 签发证书：
@@ -123,6 +125,8 @@ async function getStatuses() {
 /* ================= 应用 ================= */
 const app = express();
 app.use(cookieParser());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(session({
   secret: SESSION_SECRET,
   resave: false,
@@ -144,10 +148,70 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ error: 'unauthorized' });
 }
 
+/* ================= TOTP 动态码验证 ================= */
+/* 规则：
+ * - 若 TOTP_SECRET 已配置，则登录(GitHub通过)后必须再输一次动态码
+ * - session.totpVerified 标记本次会话已验证
+ * - 未配置 TOTP_SECRET 时跳过（兼容旧部署）
+ */
+function requireTotp(req, res, next) {
+  if (!TOTP_SECRET) return next();                 // 未启用 TOTP，直接放行
+  if (req.session && req.session.totpVerified) return next(); // 本会话已验证
+  return res.redirect('/totp/verify');             // 需验证
+}
+
+/* TOTP 设置页：未配置 secret 时生成并展示绑定 URI */
+app.get('/totp/setup', (req, res) => {
+  if (TOTP_SECRET) {
+    return res.status(200).send('<h3>TOTP 已启用</h3><p>如需重新绑定，请在 Sealos 环境变量中更换 TOTP_SECRET 后重新部署。</p>');
+  }
+  const sec = speakeasy.generateSecret({ name: 'LobeSwitch', issuer: 'LobeSwitch' });
+  const uri = sec.otpauth_url;
+  res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>绑定TOTP</title>
+<style>body{font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:0 16px;background:#0f1115;color:#e6e8eb}h1{font-size:20px}code{display:block;background:#1c2128;padding:10px;border-radius:6px;word-break:break-all;font-size:12px;color:#79c0ff}.btn{display:inline-block;margin-top:16px;padding:12px 24px;background:#2ea043;color:#fff;text-decoration:none;border-radius:8px}</style></head>
+<body><h1>🔐 绑定动态验证码</h1>
+<p>请用 <b>微软 Authenticator</b>（或 Google Authenticator）扫码，或手动输入密钥：</p>
+<code>${sec.base32}</code>
+<p style="color:#8b949e;font-size:13px">绑定后，请将此密钥填入 Sealos 环境变量 <b>TOTP_SECRET</b> 并重新部署。</p>
+<p style="color:#d29922;font-size:13px">⚠️ 密钥仅显示本次，填错需重新生成。</p>
+<div><a class="btn" href="/auth/login">我已绑定，去登录</a></div></body></html>`);
+});
+
+/* TOTP 验证页：登录后要求输入动态码 */
+app.get('/totp/verify', (req, res) => {
+  if (!TOTP_SECRET) return res.redirect('/');
+  if (req.session && req.session.totpVerified) return res.redirect('/');
+  res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>动态码验证</title>
+<style>body{font-family:system-ui,sans-serif;max-width:400px;margin:60px auto;padding:0 16px;background:#0f1115;color:#e6e8eb;text-align:center}h1{font-size:20px}input{width:160px;padding:12px;font-size:24px;text-align:center;letter-spacing:6px;background:#1c2128;color:#fff;border:1px solid #333;border-radius:8px;margin:16px 0}.btn{display:block;width:100%;padding:12px;background:#2ea043;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer}.err{color:#f85149;font-size:14px;min-height:20px}.tip{color:#8b949e;font-size:13px;margin-top:12px}</style></head>
+<body><h1>🔐 输入动态验证码</h1>
+<p style="color:#8b949e">请在认证器 App 中查看当前 6 位动态码</p>
+<div class="err" id="err"></div>
+<form method="post" action="/totp/verify">
+<input name="token" inputmode="numeric" maxlength="6" autocomplete="one-time-code" required>
+<button class="btn" type="submit">验证</button>
+</form>
+<div class="tip">每 30 秒更新一次</div></body></html>`);
+});
+
+/* TOTP 验证提交 */
+app.post('/totp/verify', (req, res) => {
+  const token = (req.body && req.body.token || '').toString().trim();
+  const valid = speakeasy.totp.verify({ secret: TOTP_SECRET, encoding: 'base32', token, window: 1 });
+  if (valid) {
+    req.session.totpVerified = true;
+    return res.redirect('/');
+  }
+  res.status(401).send(`<html><body style="background:#0f1115;color:#e6e8eb;text-align:center;padding-top:60px;font-family:system-ui"><h3>❌ 动态码错误或已过期</h3><p><a href="/totp/verify" style="color:#2ea043">重新输入</a></p></body></html>`);
+});
+
+
 /* ---------- 前端页面 ---------- */
 app.get('/', (req, res) => {
   if (!req.session || !req.session.user) {
     return res.redirect('/auth/login');
+  }
+  if (TOTP_SECRET && !req.session.totpVerified) {
+    return res.redirect('/totp/verify');
   }
   res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lobe 开关控制面板</title>
 <style>body{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;background:#0f1115;color:#e6e8eb}h1{font-size:22px}button{font-size:16px;padding:12px 20px;border:none;border-radius:8px;cursor:pointer;margin:8px 8px 8px 0}.pause{background:#d64545;color:#fff}.resume{background:#2ea043;color:#fff}.logout{background:#333;color:#ccc}.card{background:#1c2128;padding:16px;border-radius:10px;margin:12px 0}.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2a2f38}.running{color:#3fb950}.paused{color:#f85149}.err{color:#d29922}</style></head>
@@ -228,6 +292,10 @@ app.get('/auth/callback', async (req, res) => {
       return res.status(403).send('账号 ' + user.login + ' 不在白名单内，禁止访问');
     }
     req.session.user = { login: user.login, name: user.name || user.login };
+    // 若 TOTP 已启用且本会话未验证，先跳动态码验证
+    if (TOTP_SECRET && !req.session.totpVerified) {
+      return res.redirect('/totp/verify');
+    }
     res.redirect('/');
   } catch (e) {
     res.status(500).send('OAuth 回调处理失败: ' + e.message);
@@ -256,7 +324,7 @@ app.get('/logged-out', (req, res) => {
 });
 
 /* ---------- 4 个业务端点 ---------- */
-app.get('/status', requireAuth, async (req, res) => {
+app.get('/status', requireAuth, requireTotp, async (req, res) => {
   try {
     const state = readState();
     const statuses = await getStatuses();
@@ -266,7 +334,7 @@ app.get('/status', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/pause', requireAuth, async (req, res) => {
+app.post('/pause', requireAuth, requireTotp, async (req, res) => {
   if (!APPS_CONFIG.length) return res.status(400).json({ error: 'APPS_CONFIG 为空，无法暂停' });
   const state = readState();
   const saved = {};
@@ -288,7 +356,7 @@ app.post('/pause', requireAuth, async (req, res) => {
   res.json({ ok: true, savedReplicas: saved });
 });
 
-app.post('/resume', requireAuth, async (req, res) => {
+app.post('/resume', requireAuth, requireTotp, async (req, res) => {
   const state = readState();
   const errors = [];
   for (const app of APPS_CONFIG) {

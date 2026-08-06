@@ -10,9 +10,10 @@
     "node": ">=18"
   },
   "dependencies": {
-    "express": "^4.19.2",
     "cookie-parser": "^1.4.6",
+    "express": "^4.19.2",
     "express-session": "^1.18.0",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "speakeasy": "^2.0.0"
   }
 }
