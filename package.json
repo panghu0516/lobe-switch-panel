@@ -1,0 +1,18 @@
+{
+  "name": "lobe-switch-panel",
+  "version": "1.0.0",
+  "description": "Lobe 全套服务一键暂停/恢复控制面板",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cookie-parser": "^1.4.6",
+    "express-session": "^1.18.0",
+    "node-fetch": "^2.7.0"
+  }
+}

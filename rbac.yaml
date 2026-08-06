@@ -1,0 +1,61 @@
+# ============================================================
+# Lobe 一键开关控制面板 · 最小权限 RBAC
+# 命名空间: ns-feotrwac
+# 说明:
+#   - 仅对 4 个纳管应用的 scale 子资源允许 get/patch（暂停/恢复）
+#   - 仅对 4 个纳管应用本身允许 get/list（查状态用）
+#   - 读不到 Secret/ConfigMap，删不了任何资源
+# 执行: kubectl apply -f rbac.yaml
+# ============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lobe-switch-sa
+  namespace: ns-feotrwac
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lobe-switch-role
+  namespace: ns-feotrwac
+rules:
+- apiGroups:
+  - apps
+  resources:
+  - deployments/scale
+  - statefulsets/scale
+  verbs:
+  - get
+  - patch
+  resourceNames:
+  - lobehub-v2
+  - lobehub-paradedb
+  - my-devbox
+  - device-gateway
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  - statefulsets
+  verbs:
+  - get
+  - list
+  resourceNames:
+  - lobehub-v2
+  - lobehub-paradedb
+  - my-devbox
+  - device-gateway
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lobe-switch-binding
+  namespace: ns-feotrwac
+subjects:
+- kind: ServiceAccount
+  name: lobe-switch-sa
+  namespace: ns-feotrwac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lobe-switch-role
