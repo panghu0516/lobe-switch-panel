@@ -110,6 +110,15 @@ app.use(session({
   cookie: { httpOnly: true, sameSite: 'lax', maxAge: 7 * 24 * 3600 * 1000 }
 }));
 
+// 简单请求日志（方便排查）
+app.use((req, res, next) => {
+  const t0 = Date.now();
+  res.on('finish', () => {
+    console.log(`[req] ${req.method} ${req.url} -> ${res.statusCode} (${Date.now() - t0}ms)`);
+  });
+  next();
+});
+
 function requireAuth(req, res, next) {
   if (req.session && req.session.user) return next();
   return res.status(401).json({ error: 'unauthorized' });
@@ -135,10 +144,12 @@ app.get('/', (req, res) => {
 async function load(){const r=await fetch('/status');
 if(r.status===401){window.location='/auth/login';return;}
 const s=await r.json();const list=document.getElementById('list');
-const anyRunning=s && s.some(x=>x.running===true);
-list.innerHTML='<div class=card><div class=row><b>应用</b><b>副本</b><b>状态</b></div>'+s.map(x=>{
-const st=x.running===true?'<span class=running>运行中</span>':(x.running===false?'<span class=paused>已暂停</span>':'<span class=err>'+escapeHtml(x.error||'未知')+'</span>');
+const apps=(s&&s.apps)||[];
+const anyErr=apps.length===0;
+list.innerHTML='<div class=card><div class=row><b>应用</b><b>副本</b><b>状态</b></div>'+apps.map(x=>{
+const st=x.running===true?'<span class=running>运行中</span>':(x.running===false?'<span class=paused>已暂停</span>':'<span class=err>'+escapeHtml(x.error||'查询失败')+'</span>');
 return '<div class=row><span>'+escapeHtml(x.name)+' ('+x.kind+')</span><span>'+x.replicas+'</span><span>'+st+'</span></div>';}).join('')+'</div>';
+if(anyErr){const m=document.getElementById('msg');m.style.color='#d29922';m.textContent='⚠️ 未获取到应用列表，请检查 KUBE_SA_TOKEN / KUBE_API_SERVER 配置';}
 }
 async function act(kind){const btn=document.querySelectorAll('button');btn.forEach(b=>b.disabled=true);
 const msg=document.getElementById('msg');
@@ -147,6 +158,7 @@ try{const r=await fetch('/'+kind,{method:'POST'});
 if(r.status===401){msg.style.color='#f85149';msg.textContent='⚠️ 登录已过期，正在跳转登录...';setTimeout(()=>window.location='/auth/login',800);return;}
 const s=await r.json();
 if(s && s.ok){msg.style.color='#3fb950';msg.textContent=(kind==='pause'?'✅ 已全部暂停':'✅ 已全部恢复');await load();}
+else if(s&&s.errors&&s.errors.length){msg.style.color='#f85149';msg.textContent='部分失败: '+escapeHtml(s.errors.join(' | '));}
 else{msg.style.color='#f85149';msg.textContent='操作失败: '+escapeHtml((s&&s.error)||'HTTP '+r.status);}}
 catch(e){msg.style.color='#f85149';msg.textContent='请求错误: '+escapeHtml(e.message);}
 btn.forEach(b=>b.disabled=false);}
