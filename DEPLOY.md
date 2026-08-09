@@ -95,3 +95,31 @@ GITHUB_CALLBACK_URL = https://<面板域名>/auth/callback
 - can-i 预检带 resourceNames 规则必须带资源名，否则恒返回 no
 - `Warning: auto-generated secret-based tokens` 是无害提示
 - 登录一次 7 天免登录属正常设计
+
+
+## 新增功能说明（v2）
+
+### 🎛 模式切换
+- 页面"模式切换"卡片可一键切换三套配置（日常/并发Pro/开发Max）
+- 每套配置调整 LobeHub + Devbox 的 CPU/内存（requests=limits）
+- 切换前自动存档当前值，失败自动回滚，切换后轮询验证生效
+- 三套模式的数值可在代码 DEFAULT_MODES 中调整，或通过页面 POST /modes 接口（当前页面未暴露编辑框，默认取代码值）
+
+### 📊 资源展示
+- GET /resources：返回 LobeHub + Devbox 的当前 CPU/内存配置 + 对应 PVC 容量
+
+### 💾 数据库备份（内化）
+- 面板自调度（node-cron，北京时间 Asia/Shanghai），不再依赖独立 CronJob 的调度
+- 页面可配置：启用/停用、执行时间（每行一个 "HH:MM"，北京时间）
+- 到点面板创建一次性 Job（复用 BACKUP_CRONJOB 的镜像和 env，凭证不落地面板存储）
+- 备份资源配额：100m CPU / 128Mi 内存（复用原 CronJob 硬约束）
+- 页面可"立即备份"并查看最近备份 Job 状态
+
+### 🔐 新增/变更环境变量
+- BACKUP_CRONJOB: 模板 CronJob 名（默认 pg17-backup-1-2）
+- BACKUP_NAMESPACE: 备份 CronJob 所在命名空间（默认同 KUBE_NAMESPACE）
+- TZ: 容器时区需设为 Asia/Shanghai 以保证备份调度按北京时间（Sealos 环境变量填 TZ=Asia/Shanghai）
+
+### ⚠️ RBAC 需更新
+新增模式切换/资源/备份功能需要重新应用新的 rbac.yaml（主资源 patch + PVC 读取 + batch Job 权限）。
+务必先 `kubectl apply -f rbac.yaml` 再部署新代码。
