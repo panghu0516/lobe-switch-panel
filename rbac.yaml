@@ -1,9 +1,11 @@
 # ============================================================
-# Lobe 一键开关控制面板 · 最小权限 RBAC
+# Lobe 一键开关控制面板 · 最小权限 RBAC (v2)
 # 命名空间: ns-feotrwac
 # 说明:
-#   - 仅对 4 个纳管应用的 scale 子资源允许 get/patch（暂停/恢复）
-#   - 仅对 4 个纳管应用本身允许 get/list（查状态用）
+#   - scale 子资源: 暂停/恢复 (get/patch)
+#   - 主资源 statefulsets/deployments: 读配置 + patch resources (模式切换)
+#   - persistentvolumeclaims: 读 PVC 容量/用量 (资源展示)
+#   - cronjobs/jobs (batch): 数据库备份管理 (创建/触发/查状态)
 #   - 读不到 Secret/ConfigMap，删不了任何资源
 # 执行: kubectl apply -f rbac.yaml
 # ============================================================
@@ -19,6 +21,7 @@ metadata:
   name: lobe-switch-role
   namespace: ns-feotrwac
 rules:
+# 1. scale 子资源（暂停/恢复）
 - apiGroups:
   - apps
   resources:
@@ -32,6 +35,7 @@ rules:
   - lobehub-paradedb
   - my-devbox
   - device-gateway
+# 2. 主资源（读配置 + patch resources 做模式切换）
 - apiGroups:
   - apps
   resources:
@@ -40,11 +44,44 @@ rules:
   verbs:
   - get
   - list
+  - patch
   resourceNames:
   - lobehub-v2
   - lobehub-paradedb
   - my-devbox
   - device-gateway
+# 3. PVC 读取（资源展示）
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - get
+  - list
+  resourceNames:
+  - lobehub-v2
+  - lobehub-paradedb
+  - my-devbox
+  - device-gateway
+# 4. 数据库备份（batch）
+- apiGroups:
+  - batch
+  resources:
+  - cronjobs
+  - jobs
+  verbs:
+  - get
+  - list
+  - create
+  - patch
+# 5. Pod 读取（备份 Job 状态含日志需求时用，只读）
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

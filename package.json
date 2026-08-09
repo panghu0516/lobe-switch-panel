@@ -15,6 +15,7 @@
     "express-session": "^1.18.0",
     "node-fetch": "^2.7.0",
     "speakeasy": "^2.0.0",
-    "qrcode": "^1.5.3"
+    "qrcode": "^1.5.3",
+    "node-cron": "^3.0.3"
   }
 }

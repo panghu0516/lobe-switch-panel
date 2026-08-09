@@ -1,5 +1,3 @@
-'use strict';
-
 const express = require('express');
 const session = require('express-session');
 const cookieParser = require('cookie-parser');
@@ -10,66 +8,87 @@ const crypto = require('crypto');
 const https = require('https');
 const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
+const cron = require('node-cron');
 
-/* ================= 环境变量 ================= */
-const PORT = process.env.PORT || 3000;
+/* ================= 配置 ================= */
+const PORT = parseInt(process.env.PORT || '3000', 10);
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID || '';
 const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || '';
 const GITHUB_CALLBACK_URL = process.env.GITHUB_CALLBACK_URL || '';
-const ALLOWED_GITHUB_LOGIN = process.env.ALLOWED_GITHUB_LOGIN || '';
+const ALLOWED_GITHUB_LOGIN = (process.env.ALLOWED_GITHUB_LOGIN || '').split(',').map(s => s.trim()).filter(Boolean);
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const TOTP_SECRET = process.env.TOTP_SECRET || '';
+const AUTH_MODE = process.env.AUTH_MODE || 'both';
 const KUBE_API_SERVER = (process.env.KUBE_API_SERVER || '').replace(/\/+$/, '');
 const KUBE_SA_TOKEN = process.env.KUBE_SA_TOKEN || '';
 const KUBE_NAMESPACE = process.env.KUBE_NAMESPACE || 'default';
 const APPS_CONFIG = parseApps(process.env.APPS_CONFIG || '[]');
 const STATE_FILE = process.env.STATE_FILE || '/data/state.json';
-const TOTP_SECRET = process.env.TOTP_SECRET || '';   // 可为空，首次通过 /totp/setup 生成并注入
-const AUTH_MODE = (process.env.AUTH_MODE || 'both').toLowerCase(); // github | totp | both（空/未知 => 拒绝访问）
+const BACKUP_CRONJOB = process.env.BACKUP_CRONJOB || 'pg17-backup-1-2';
+const BACKUP_NAMESPACE = process.env.BACKUP_NAMESPACE || KUBE_NAMESPACE;
 
-/* ================= K8s TLS Agent =================
- * 集群内 API server 用内部 CA 签发证书：
- * 1) 优先使用 Pod 内挂载的 CA 证书（安全）
- * 2) 未挂载则跳过 TLS 校验（仅限集群内地址，无中间人风险）
- */
+// 模式切换针对的两个维度应用（lobe 主服务 + devbox）
+const MODE_TARGETS = [
+  { kind: 'StatefulSet', name: 'lobehub-v2', label: 'LobeHub' },
+  { kind: 'StatefulSet', name: 'my-devbox', label: 'Devbox' }
+];
+
+// 三套默认模式（cpu / mem 均指 requests 与 limits 一致）
+const DEFAULT_MODES = {
+  daily: { label: '日常', desc: '轻量日常运维', configs: { lobehub: { cpu: '200m', mem: '2Gi' }, devbox: { cpu: '200m', mem: '0.5Gi' } } },
+  pro:   { label: '并发 Pro', desc: '高并发运行', configs: { lobehub: { cpu: '500m', mem: '2Gi' }, devbox: { cpu: '500m', mem: '1Gi' } } },
+  develop: { label: '开发 Max', desc: '开发编译模式', configs: { lobehub: { cpu: '500m', mem: '2Gi' }, devbox: { cpu: '1', mem: '2Gi' } } }
+};
+
+let kubeAgent = null;
 const KUBE_CA_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt';
-let kubeAgent;
 if (fs.existsSync(KUBE_CA_PATH)) {
   kubeAgent = new https.Agent({ ca: fs.readFileSync(KUBE_CA_PATH) });
   console.log('[kube] TLS: 使用集群内 CA 证书 ' + KUBE_CA_PATH);
 } else {
+  console.log('[kube] TLS: 未找到集群 CA，将跳过证书校验（开发环境）');
   kubeAgent = new https.Agent({ rejectUnauthorized: false });
-  console.log('[kube] TLS: 未找到集群 CA，跳过证书校验（仅限集群内通信）');
 }
 
-/* ================= 工具函数 ================= */
 function parseApps(str) {
   try {
     const arr = JSON.parse(str);
-    if (!Array.isArray(arr)) return [];
-    return arr
-      .filter(a => a && a.name && a.kind)
-      .map(a => ({ name: a.name, kind: a.kind, lastReplicas: Number(a.replicas) || 1 }));
+    return Array.isArray(arr) ? arr : [];
   } catch (e) {
     console.error('[config] APPS_CONFIG 解析失败:', e.message);
     return [];
   }
 }
 
+/* ================= 状态文件 ================= */
 function readState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
   } catch (e) {
-    return { savedReplicas: {}, paused: false };
+    return {};
   }
 }
-
 function writeState(state) {
-  try {
-    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (e) {
-    console.error('[state] 状态写入失败:', e.message);
+  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+// 读取或初始化模式配置（存于 state.json）
+function getModeConfig() {
+  const s = readState();
+  if (!s.modes || !s.modes.daily || !s.modes.develop) {
+    s.modes = JSON.parse(JSON.stringify(DEFAULT_MODES));
+    s.activeMode = s.activeMode || 'daily';
+    writeState(s);
   }
+  if (!s.activeMode) { s.activeMode = 'daily'; writeState(s); }
+  return { modes: s.modes, activeMode: s.activeMode };
+}
+function saveModeConfig(modes, activeMode) {
+  const s = readState();
+  s.modes = modes;
+  if (activeMode) s.activeMode = activeMode;
+  writeState(s);
 }
 
 /* ================= K8s API ================= */
@@ -78,6 +97,22 @@ function kubeUrl(kind, name, sub) {
   let u = `${KUBE_API_SERVER}/apis/apps/v1/namespaces/${KUBE_NAMESPACE}/${res}/${name}`;
   if (sub) u += `/${sub}`;
   return u;
+}
+
+async function kubeRequest(method, url, bodyObj) {
+  const res = await fetch(url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${KUBE_SA_TOKEN}`,
+      'Content-Type': 'application/json-patch+json',
+      Accept: 'application/json'
+    },
+    body: bodyObj ? JSON.stringify(bodyObj) : undefined,
+    agent: kubeAgent,
+    timeout: 15000
+  });
+  if (!res.ok) throw new Error(`${method} ${url.split('/apis/')[1]}: ${res.status} ${await safeBody(res)}`);
+  return res.json();
 }
 
 async function kubeGet(kind, name) {
@@ -106,6 +141,54 @@ async function kubeScale(kind, name, replicas) {
   return res.json();
 }
 
+// 读取应用完整 spec（用于模式切换前的存档 + 资源展示）
+async function kubeGetFull(kind, name) {
+  const data = await kubeRequest('GET', kubeUrl(kind, name));
+  const c = data.spec && data.spec.template && data.spec.template.spec && data.spec.template.spec.containers;
+  const container = c && c[0];
+  return {
+    name: data.metadata.name,
+    kind,
+    replicas: data.spec.replicas,
+    ready: data.status && data.status.replicas,
+    resources: (container && container.resources) || null,
+    image: container && container.image
+  };
+}
+
+// 读取 PVC 容量/用量
+async function kubeGetPVC(pvcName) {
+  const url = `${KUBE_API_SERVER}/api/v1/namespaces/${KUBE_NAMESPACE}/persistentvolumeclaims/${pvcName}`;
+  const data = await kubeRequest('GET', url);
+  const cap = data.status && data.status.capacity;
+  return {
+    name: data.metadata.name,
+    capacity: cap && cap.storage ? cap.storage : (data.spec.resources && data.spec.resources.requests && data.spec.resources.requests.storage),
+    phase: data.status && data.status.phase
+  };
+}
+
+// 精细 patch 单个容器的 resources
+async function kubePatchResources(kind, name, resources) {
+  const patch = [{
+    op: 'replace',
+    path: '/spec/template/spec/containers/0/resources',
+    value: resources
+  }];
+  const res = await fetch(kubeUrl(kind, name), {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${KUBE_SA_TOKEN}`,
+      'Content-Type': 'application/json-patch+json'
+    },
+    body: JSON.stringify(patch),
+    agent: kubeAgent,
+    timeout: 15000
+  });
+  if (!res.ok) throw new Error(`PATCH resources ${name}: ${res.status} ${await safeBody(res)}`);
+  return res.json();
+}
+
 async function safeBody(res) {
   try { return (await res.text()).slice(0, 300); } catch (e) { return ''; }
 }
@@ -122,6 +205,216 @@ async function getStatuses() {
     }
   }
   return list;
+}
+
+/* ================= 模式切换（分步确认 + 回滚） ================= */
+function buildResources(mem, cpu) {
+  return {
+    requests: { cpu: cpu, memory: mem },
+    limits: { cpu: cpu, memory: mem }
+  };
+}
+
+// key: 'lobehub' | 'devbox' -> 对应 MODE_TARGETS 里 name
+function targetFor(key) {
+  const nameMap = { lobehub: 'lobehub-v2', devbox: 'my-devbox' };
+  return MODE_TARGETS.find(t => t.name === nameMap[key]);
+}
+
+async function switchMode(modeKey) {
+  const { modes } = getModeConfig();
+  const mode = modes[modeKey];
+  if (!mode) throw new Error('未知模式: ' + modeKey);
+  const cfg = mode.configs; // { lobehub: {cpu,mem}, devbox: {cpu,mem} }
+
+  // 1. 存档当前 resources（用于回滚）
+  const saved = {};
+  for (const key of ['lobehub', 'devbox']) {
+    const t = targetFor(key);
+    const cur = await kubeGetFull(t.kind, t.name);
+    saved[key] = cur.resources;
+  }
+
+  const errors = [];
+  const applied = {};
+  try {
+    // 2. 依次应用
+    for (const key of ['lobehub', 'devbox']) {
+      const t = targetFor(key);
+      const c = cfg[key];
+      await kubePatchResources(t.kind, t.name, buildResources(c.mem, c.cpu));
+      applied[key] = true;
+    }
+  } catch (e) {
+    errors.push(e.message);
+  }
+
+  // 3. 验证（轮询确认生效）
+  if (errors.length === 0) {
+    for (const key of ['lobehub', 'devbox']) {
+      try {
+        const t = targetFor(key);
+        const verify = await kubeVerifyResources(t.kind, t.name, cfg[key]);
+        if (!verify) {
+          errors.push(`${targetFor(key).label} resources 未生效`);
+        }
+      } catch (e) {
+        errors.push(`${targetFor(key).label} 验证失败: ${e.message}`);
+      }
+    }
+  }
+
+  // 4. 失败则回滚
+  if (errors.length > 0) {
+    const rollbackErrs = [];
+    for (const key of Object.keys(saved)) {
+      if (saved[key]) {
+        try {
+          const t = targetFor(key);
+          await kubePatchResources(t.kind, t.name, saved[key]);
+        } catch (e) {
+          rollbackErrs.push(`${key}: ${e.message}`);
+        }
+      }
+    }
+    const s = readState();
+    s.activeMode = s.activeMode || 'daily';
+    writeState(s);
+    throw new Error(`模式切换失败已回滚: ${errors.join('; ')}${rollbackErrs.length ? ' | 回滚异常: ' + rollbackErrs.join('; ') : ''}`);
+  }
+
+  // 5. 记录 activeMode
+  const s = readState();
+  s.activeMode = modeKey;
+  writeState(s);
+  return { ok: true, mode: modeKey, applied, saved };
+}
+
+// 验证某个 target 的 resources 是否等于期望值
+async function kubeVerifyResources(kind, name, expect) {
+  const cur = await kubeGetFull(kind, name);
+  const r = cur.resources;
+  if (!r || !r.requests || !r.limits) return false;
+  const ok = r.requests.cpu === expect.cpu && r.requests.memory === expect.mem &&
+             r.limits.cpu === expect.cpu && r.limits.memory === expect.mem;
+  return ok;
+}
+
+/* ================= 数据库备份（内化调度） ================= */
+// 备份时间配置存于 state.json: { backup: { enabled, times: ['12:00','15:00','19:00','23:00'] } }
+function getBackupConfig() {
+  const s = readState();
+  if (!s.backup) {
+    s.backup = { enabled: true, times: ['12:00', '15:00', '19:00', '23:00'] };
+    writeState(s);
+  }
+  return s.backup;
+}
+function saveBackupConfig(bc) {
+  const s = readState();
+  s.backup = bc;
+  writeState(s);
+}
+
+// 读取现有 CronJob 的 env（复用它，凭证不落地面板存储）
+async function getBackupCronJobEnv() {
+  const url = `${KUBE_API_SERVER}/apis/batch/v1/namespaces/${BACKUP_NAMESPACE}/cronjobs/${BACKUP_CRONJOB}`;
+  const data = await kubeRequest('GET', url);
+  const c = data.spec && data.spec.jobTemplate && data.spec.jobTemplate.spec && data.spec.jobTemplate.spec.template && data.spec.jobTemplate.spec.template.spec && data.spec.jobTemplate.spec.template.spec.containers;
+  const container = c && c[0];
+  if (!container) throw new Error('未找到 CronJob 容器定义');
+  return { image: container.image, env: container.env || [], command: container.command, args: container.args };
+}
+
+// 触发一次备份（创建一次性 Job）
+async function triggerBackup() {
+  const tpl = await getBackupCronJobEnv();
+  const ts = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '.') + '-panel';
+  const jobName = `pg-backup-${ts}`.replace(/\./g, '-').toLowerCase();
+  const job = {
+    apiVersion: 'batch/v1',
+    kind: 'Job',
+    metadata: { name: jobName, namespace: BACKUP_NAMESPACE, labels: { app: 'lobe-switch-backup', 'app.kubernetes.io/managed-by': 'lobe-switch-panel' } },
+    spec: {
+      backoffLimit: 0,
+      activeDeadlineSeconds: 600,
+      template: {
+        spec: {
+          restartPolicy: 'Never',
+          containers: [{
+            name: 'backup',
+            image: tpl.image,
+            env: tpl.env,
+            resources: { requests: { cpu: '100m', memory: '128Mi' }, limits: { cpu: '100m', memory: '128Mi' } }
+          }]
+        }
+      }
+    }
+  };
+  const url = `${KUBE_API_SERVER}/apis/batch/v1/namespaces/${BACKUP_NAMESPACE}/jobs`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${KUBE_SA_TOKEN}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(job),
+    agent: kubeAgent,
+    timeout: 15000
+  });
+  if (!res.ok) throw new Error(`创建备份 Job ${jobName}: ${res.status} ${await safeBody(res)}`);
+  return jobName;
+}
+
+// 列出最近备份 Job 状态
+async function listBackupJobs(limit = 8) {
+  const url = `${KUBE_API_SERVER}/apis/batch/v1/namespaces/${BACKUP_NAMESPACE}/jobs?labelSelector=app%3Dlobe-switch-backup`;
+  const data = await kubeRequest('GET', url);
+  const items = (data.items || []).slice().sort((a, b) => (b.metadata.creationTimestamp || '').localeCompare(a.metadata.creationTimestamp || ''));
+  return items.slice(0, limit).map(j => {
+    const cond = (j.status && j.status.conditions && j.status.conditions[0]) || {};
+    let state = 'pending';
+    if (j.status && j.status.succeeded) state = 'success';
+    else if (j.status && j.status.failed) state = 'failed';
+    return {
+      name: j.metadata.name,
+      created: j.metadata.creationTimestamp,
+      state,
+      condition: cond.type,
+      reason: cond.reason,
+      message: cond.message
+    };
+  });
+}
+
+// 备份调度：node-cron 按北京时间执行
+let backupCronTasks = [];
+function scheduleBackups() {
+  for (const t of backupCronTasks) t.stop();
+  backupCronTasks = [];
+  const bc = getBackupConfig();
+  if (!bc.enabled || !bc.times || !bc.times.length) return;
+  for (const timeStr of bc.times) {
+    const m = timeStr.match(/^(\d{1,2}):(\d{2})$/);
+    if (!m) continue;
+    const [ , hh, mm ] = m;
+    const hour = parseInt(hh, 10), minute = parseInt(mm, 10);
+    if (hour > 23 || minute > 59) continue;
+    // node-cron 表达式：分 时 * * *，容器 TZ 需为 Asia/Shanghai（启动时设置 TZ=Asia/Shanghai）
+    const expr = `${minute} ${hour} * * *`;
+    try {
+      const task = cron.schedule(expr, async () => {
+        console.log(`[backup] 触发定时备份 ${timeStr} (北京时间)`);
+        try {
+          const name = await triggerBackup();
+          console.log(`[backup] 已创建 Job: ${name}`);
+        } catch (e) {
+          console.error(`[backup] 定时备份失败: ${e.message}`);
+        }
+      }, { timezone: 'Asia/Shanghai' });
+      backupCronTasks.push(task);
+      console.log(`[backup] 已调度 ${timeStr} (cron: ${expr} @Asia/Shanghai)`);
+    } catch (e) {
+      console.error(`[backup] 调度失败 ${timeStr}: ${e.message}`);
+    }
+  }
 }
 
 /* ================= 应用 ================= */
@@ -146,116 +439,173 @@ app.use((req, res, next) => {
 });
 
 function authModeOk() {
-  if (AUTH_MODE === 'totp') return !!TOTP_SECRET;                 // 只要动态码：必须已配置 TOTP_SECRET
-  if (AUTH_MODE === 'github') return true;                        // 只要 GitHub
-  if (AUTH_MODE === 'both') return true;                          // 两者都要
-  return false;                                                    // 未知模式 => 拒绝访问
+  if (AUTH_MODE === 'totp') return !!TOTP_SECRET;
+  if (AUTH_MODE === 'github') return true;
+  return false;
 }
 
 function requireAuth(req, res, next) {
-  if (!authModeOk()) return res.status(503).send('认证模式未配置或无效，禁止访问');
   if (AUTH_MODE === 'totp') {
-    // 只要动态码：动态码已验证即放行，不要求 GitHub
     if (req.session && req.session.totpVerified) return next();
     return res.status(401).json({ error: 'unauthorized' });
   }
-  // github / both：要求 GitHub 登录
-  if (req.session && req.session.user) return next();
-  return res.status(401).json({ error: 'unauthorized' });
+  if (!req.session || !req.session.user) return res.status(401).json({ error: 'unauthorized' });
+  if (TOTP_SECRET && !req.session.totpVerified) return res.status(401).json({ error: 'totp required' });
+  next();
 }
 
-/* ================= TOTP 动态码验证 ================= */
-/* 规则：
- * - 若 TOTP_SECRET 已配置，则登录(GitHub通过)后必须再输一次动态码
- * - session.totpVerified 标记本次会话已验证
- * - 未配置 TOTP_SECRET 时跳过（兼容旧部署）
- */
 function requireTotp(req, res, next) {
-  if (!TOTP_SECRET) return next();                 // 未启用 TOTP，直接放行
-  if (req.session && req.session.totpVerified) return next(); // 本会话已验证
-  return res.redirect('/totp/verify');             // 需验证
+  if (TOTP_SECRET && !(req.session && req.session.totpVerified)) return res.status(401).json({ error: 'totp required' });
+  next();
 }
 
-/* TOTP 设置页：未配置 secret 时生成并展示绑定 URI（含二维码） */
+/* ================= TOTP ================= */
 app.get('/totp/setup', async (req, res) => {
   if (TOTP_SECRET) {
-    return res.status(200).send('<!DOCTYPE html><html><head><meta charset="utf-8"><title>TOTP 已启用</title></head><body style="background:#0f1115;color:#e6e8eb;font-family:system-ui;text-align:center;padding-top:60px"><h3>🔐 TOTP 已启用</h3><p>如需重新绑定，请在 Sealos 环境变量中<b>更换 TOTP_SECRET</b> 并重新部署。</p><p style="color:#8b949e;font-size:13px">⚠️ 更换后需在 Authenticator 中重新扫码绑定新密钥。</p></body></html>');
+    return res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>TOTP 已启用</title></head><body style="font-family:system-ui;background:#0f1115;color:#e6e8eb;padding:40px"><h2>🔐 TOTP 已启用</h2><p>如需重新绑定，请改环境变量 TOTP_SECRET 后重新部署。</p><a href="/">返回</a></body></html>`);
   }
-  const sec = speakeasy.generateSecret({ name: 'LobeSwitch', issuer: 'LobeSwitch' });
-  const uri = sec.otpauth_url;
-  const qr = await QRCode.toDataURL(uri);
-  res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>绑定TOTP</title>
-<style>body{font-family:system-ui,sans-serif;max-width:560px;margin:40px auto;padding:0 16px;background:#0f1115;color:#e6e8eb}h1{font-size:20px}code{display:block;background:#1c2128;padding:10px;border-radius:6px;word-break:break-all;font-size:12px;color:#79c0ff}.btn{display:inline-block;margin-top:16px;padding:12px 24px;background:#2ea043;color:#fff;text-decoration:none;border-radius:8px}.qr{background:#fff;padding:12px;border-radius:8px;display:inline-block;margin:12px 0}</style></head>
-<body><h1>🔐 绑定动态验证码</h1>
-<p>请用 <b>微软 Authenticator</b>（或 Google Authenticator）<b>扫码下方二维码</b>：</p>
-<div class="qr"><img src="${qr}" alt="QR Code" style="width:220px;height:220px"></div>
-<br>或手动输入密钥：<code>${sec.base32}</code>
-<p style="color:#8b949e;font-size:13px">扫码后 Authenticator 会出现一个 <b>6 位</b>动态码。<br>绑定后，请将此密钥填入 Sealos 环境变量 <b>TOTP_SECRET</b> 并重新部署。</p>
-<p style="color:#d29922;font-size:13px">⚠️ 密钥仅显示本次，请先记下再刷新页面。</p>
-<div><a class="btn" href="/auth/login">我已绑定，去登录</a></div></body></html>`);
+  const secret = speakeasy.generateSecret({ length: 20, name: 'Lobe-Switch-Panel' });
+  const otpauth = speakeasy.otpauthURL({ secret: secret.base32, label: 'Lobe-Switch-Panel', issuer: 'Lobe', encoding: 'base32' });
+  const qr = await QRCode.toDataURL(otpauth);
+  res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>绑定TOTP</title><style>body{font-family:system-ui,sans-serif;background:#0f1115;color:#e6e8eb;padding:40px;max-width:480px;margin:auto}h2{font-size:20px}img{background:#fff;padding:12px;border-radius:8px}.key{background:#1c2128;padding:16px;border-radius:8px;font-family:monospace;word-break:break-all;color:#3fb950}.warn{color:#d29922;font-weight:bold}</style></head><body><h2>🔐 绑定 TOTP 动态码</h2><p>用微软 Authenticator 扫码，或手动输入密钥：</p><img src="${qr}" alt="QR"><p class="key">${secret.base32}</p><p class="warn">⚠️ 扫码/复制后请勿刷新本页，否则密钥会更换。</p><p>把上面的 base32 密钥填入 Sealos 环境变量 <code>TOTP_SECRET</code> 后重新部署。</p><a href="/">返回</a></body></html>`);
 });
 
-/* TOTP 验证页：登录后要求输入动态码 */
 app.get('/totp/verify', (req, res) => {
-  if (!TOTP_SECRET) return res.redirect('/');
-  if (req.session && req.session.totpVerified) return res.redirect('/');
-  res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>动态码验证</title>
-<style>body{font-family:system-ui,sans-serif;max-width:400px;margin:60px auto;padding:0 16px;background:#0f1115;color:#e6e8eb;text-align:center}h1{font-size:20px}input{width:160px;padding:12px;font-size:24px;text-align:center;letter-spacing:6px;background:#1c2128;color:#fff;border:1px solid #333;border-radius:8px;margin:16px 0}.btn{display:block;width:100%;padding:12px;background:#2ea043;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer}.err{color:#f85149;font-size:14px;min-height:20px}.tip{color:#8b949e;font-size:13px;margin-top:12px}</style></head>
-<body><h1>🔐 输入动态验证码</h1>
-<p style="color:#8b949e">请在认证器 App 中查看当前 6 位动态码</p>
-<div class="err" id="err"></div>
-<form method="post" action="/totp/verify">
-<input name="token" inputmode="numeric" maxlength="6" autocomplete="one-time-code" required>
-<button class="btn" type="submit">验证</button>
-</form>
-<div class="tip">每 30 秒更新一次</div></body></html>`);
+  res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>动态码验证</title><style>body{font-family:system-ui;background:#0f1115;color:#e6e8eb;padding:40px;max-width:360px;margin:auto}input{font-size:20px;padding:10px;width:100%;margin:8px 0;border-radius:6px;border:1px solid #333;background:#1c2128;color:#e6e8eb}button{font-size:16px;padding:12px;width:100%;border:none;border-radius:8px;background:#2ea043;color:#fff;cursor:pointer}label{display:block;margin-top:12px}</style></head><body><h2>🔐 输入动态码</h2><form method="post" action="/totp/verify"><label>6 位动态码</label><input type="text" name="token" maxlength="6" autocomplete="one-time-code" required><button type="submit">验证</button></form><p id="msg" style="color:#f85149"></p><script>const q=new URLSearchParams(location.search);if(q.get('e'))document.getElementById('msg').textContent='动态码错误，请重试';</script></body></html>`);
 });
 
-/* TOTP 验证提交 */
 app.post('/totp/verify', (req, res) => {
-  const token = (req.body && req.body.token || '').toString().trim();
-  const valid = speakeasy.totp.verify({ secret: TOTP_SECRET, encoding: 'base32', token, window: 1 });
-  if (valid) {
+  const token = String(req.body.token || '').trim();
+  const ok = speakeasy.totp.verify({ secret: TOTP_SECRET, encoding: 'base32', token, window: 1 });
+  if (ok) {
     req.session.totpVerified = true;
     return res.redirect('/');
   }
-  res.status(401).send(`<html><body style="background:#0f1115;color:#e6e8eb;text-align:center;padding-top:60px;font-family:system-ui"><h3>❌ 动态码错误或已过期</h3><p><a href="/totp/verify" style="color:#2ea043">重新输入</a></p></body></html>`);
+  res.redirect('/totp/verify?e=1');
 });
 
-
-/* ---------- 前端页面 ---------- */
+/* ================= 首页 ================= */
 app.get('/', (req, res) => {
   if (!authModeOk()) return res.status(503).send('认证模式未配置或无效，禁止访问');
   if (AUTH_MODE === 'totp') {
-    // 只要动态码：未验证则跳动态码页
     if (!req.session || !req.session.totpVerified) return res.redirect('/totp/verify');
   } else {
-    // github / both：先要求 GitHub 登录
     if (!req.session || !req.session.user) return res.redirect('/auth/login');
     if (TOTP_SECRET && !req.session.totpVerified) return res.redirect('/totp/verify');
   }
   res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lobe 开关控制面板</title>
-<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 16px;background:#0f1115;color:#e6e8eb}h1{font-size:22px}button{font-size:16px;padding:12px 20px;border:none;border-radius:8px;cursor:pointer;margin:8px 8px 8px 0}.pause{background:#d64545;color:#fff}.resume{background:#2ea043;color:#fff}.logout{background:#333;color:#ccc}.card{background:#1c2128;padding:16px;border-radius:10px;margin:12px 0}.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2a2f38}.running{color:#3fb950}.paused{color:#f85149}.err{color:#d29922}</style></head>
+<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;background:#0f1115;color:#e6e8eb}h1{font-size:22px}button{font-size:15px;padding:10px 16px;border:none;border-radius:8px;cursor:pointer;margin:6px 6px 6px 0}.pause{background:#d64545;color:#fff}.resume{background:#2ea043;color:#fff}.logout{background:#333;color:#ccc}.card{background:#1c2128;padding:16px;border-radius:10px;margin:12px 0}.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2a2f38;gap:8px}.running{color:#3fb950}.paused{color:#f85149}.err{color:#d29922}.ok{color:#3fb950}.mode-btn{background:#21262d;border:1px solid #30363d;color:#e6e8eb}.mode-btn[data-active="1"]{background:#1f6feb;border-color:#1f6feb;color:#fff}select,input[type=text],input[type=number]{background:#0d1117;border:1px solid #30363d;color:#e6e8eb;padding:6px;border-radius:6px;margin:2px}h2{font-size:17px;margin:16px 0 8px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.mono{font-family:monospace}.small{font-size:13px;color:#8b949e}.tag{display:inline-block;background:#161b22;border:1px solid #30363d;padding:2px 8px;border-radius:20px;font-size:12px;margin:2px}</style></head>
 <body><h1>🔌 Lobe 一键开关</h1>
 <p>已验证：<b>${escapeHtml(AUTH_MODE === 'totp' ? '动态码' : (req.session.user ? req.session.user.login : ''))}</b></p>
 <div id="msg" style="margin:8px 0;font-weight:bold"></div>
+
+<div class="card">
+<h2>📊 资源状态</h2>
+<div id="res"></div>
+</div>
+
+<div class="card">
+<h2>🎛 模式切换</h2>
+<div id="modes"></div>
+<div id="modeMsg" class="small" style="margin-top:8px"></div>
+</div>
+
+<div class="card">
+<h2>🚦 应用控制</h2>
 <div id="list"></div>
 <div>
 <button class="pause" onclick="act('pause')">⏸ 一键暂停</button>
 <button class="resume" onclick="act('resume')">▶ 一键恢复</button>
-<button class="logout" onclick="window.location='/logout'">退出</button>
 </div>
+</div>
+
+<div class="card">
+<h2>💾 数据库备份</h2>
+<div id="bk"></div>
+</div>
+
+<div><button class="logout" onclick="window.location='/logout'">退出登录</button></div>
 <script>
 const LOGIN_URL='${AUTH_MODE === 'totp' ? '/totp/verify' : '/auth/login'}';
-async function load(){const r=await fetch('/status');
-if(r.status===401){window.location=LOGIN_URL;return;}
-const s=await r.json();const list=document.getElementById('list');
-const apps=(s&&s.apps)||[];
-const anyErr=apps.length===0;
-list.innerHTML='<div class=card><div class=row><b>应用</b><b>副本</b><b>状态</b></div>'+apps.map(x=>{
-const st=x.running===true?'<span class=running>运行中</span>':(x.running===false?'<span class=paused>已暂停</span>':'<span class=err>'+escapeHtml(x.error||'查询失败')+'</span>');
-return '<div class=row><span>'+escapeHtml(x.name)+' ('+x.kind+')</span><span>'+x.replicas+'</span><span>'+st+'</span></div>';}).join('')+'</div>';
+async function j(url,opts){const r=await fetch(url,opts);if(r.status===401){window.location=LOGIN_URL;return null;}return r.json();}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+
+async function load(){await loadStatus();await loadResources();await loadModes();await loadBackup();}
+async function loadStatus(){
+const s=await j('/status');if(!s)return;const list=document.getElementById('list');
+const apps=(s&&s.apps)||[];const anyErr=apps.length===0;
+list.innerHTML='<div class=row><b>应用</b><b>副本</b><b>状态</b></div>'+apps.map(x=>{
+const st=x.running===true?'<span class=running>运行中</span>':(x.running===false?'<span class=paused>已暂停</span>':'<span class=err>'+esc(x.error||'查询失败')+'</span>');
+return '<div class=row><span>'+esc(x.name)+' ('+x.kind+')</span><span>'+x.replicas+'</span><span>'+st+'</span></div>';}).join('')+'</div>';
 if(anyErr){const m=document.getElementById('msg');m.style.color='#d29922';m.textContent='⚠️ 未获取到应用列表，请检查 KUBE_SA_TOKEN / KUBE_API_SERVER 配置';}
+}
+async function loadResources(){
+const d=await j('/resources');if(!d)return;const el=document.getElementById('res');
+if(d.error){el.innerHTML='<span class=err>'+esc(d.error)+'</span>';return;}
+const r=(d.resources||[]).map(x=>{
+const rc=x.resources||{};
+const req=rc.requests||{},lim=rc.limits||{};
+return '<div class=row><span><b>'+esc(x.label)+'</b> <span class=small>('+esc(x.name)+')</span></span><span class=mono>CPU '+esc(lim.cpu||req.cpu||'-')+' · MEM '+esc(lim.memory||req.memory||'-')+'</span></div>';
+}).join('');
+const pVs=(d.pvcs||[]).map(p=>'<span class=tag>'+esc(p.name)+' 容量 '+esc(p.capacity||'-')+'</span>').join('');
+el.innerHTML=r+(pVs?'<div class=small style="margin-top:8px">持久卷: '+pVs+'</div>':'');
+}
+async function loadModes(){
+const d=await j('/modes');if(!d||!d.modes)return;const el=document.getElementById('modes');
+const keys=Object.keys(d.modes);
+const btns=keys.map(k=>{
+const m=d.modes[k];const c=m.configs;
+const cpuL=c.lobehub?c.lobehub.cpu:'-',memL=c.lobehub?c.lobehub.mem:'-';
+const cpuD=c.devbox?c.devbox.cpu:'-',memD=c.devbox?c.devbox.mem:'-';
+return '<button class="mode-btn" data-active="'+(d.activeMode===k?1:0)+'" onclick="switchMode(\''+k+'\')" title="'+esc(m.desc)+'">'+esc(m.label)+'<br><span class=small>Lobe '+esc(cpuL)+'/'+esc(memL)+' · Dev '+esc(cpuD)+'/'+esc(memD)+'</span></button>';
+}).join('');
+el.innerHTML=btns+'<div id="modeMsg" class=small></div>';
+}
+async function switchMode(k){
+const m=document.getElementById('modeMsg');if(!m)return;
+if(!confirm('切换到该模式将调整 LobeHub 与 Devbox 的 CPU/内存配额，确认？'))return;
+m.style.color='#d29922';m.textContent='⏳ 切换中...';
+const d=await j('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:k})});
+if(!d)return;
+if(d.ok){m.style.color='#3fb950';m.textContent='✅ 已切换到 '+esc(d.mode);await loadResources();await loadModes();}
+else{m.style.color='#f85149';m.textContent=esc(d.error||'切换失败'+(d.rollback?'（已回滚）':''));}
+}
+async function loadBackup(){
+const d=await j('/backup');if(!d)return;const el=document.getElementById('bk');
+if(d.error){el.innerHTML='<span class=err>'+esc(d.error)+'</span>';return;}
+const bc=d.config||{};
+el.innerHTML='<div class=row><span>定时备份</span><label><input type="checkbox" id="bkEnabled" '+(bc.enabled?'checked':'')+' onchange="saveBk()"> 启用</label></div>'+
+'<div class=row><span>执行时间（北京时间，每行一个 时:分）</span></div>'+
+'<textarea id="bkTimes" rows="4" style="width:100%;background:#0d1117;border:1px solid #30363d;color:#e6e8eb;border-radius:6px;padding:6px">'+esc((bc.times||[]).join('\\n'))+'</textarea>'+
+'<div style="margin-top:8px"><button onclick="saveBk()">💾 保存备份配置</button> <button onclick="runBk()">▶ 立即备份</button></div>'+
+'<div id="bkMsg" class=small style="margin-top:8px"></div>'+
+'<div id="bkJobs" style="margin-top:8px"></div>';
+loadBkJobs();
+}
+async function saveBk(){
+const d=await j('/backup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+enabled:document.getElementById('bkEnabled').checked,
+times:document.getElementById('bkTimes').value.split('\\n').map(s=>s.trim()).filter(Boolean)
+})});
+const m=document.getElementById('bkMsg');if(!d||!m)return;
+m.style.color=d.ok?'#3fb950':'#f85149';m.textContent=d.ok?'✅ 备份配置已保存':'❌ '+esc(d.error||'保存失败');
+}
+async function runBk(){
+const m=document.getElementById('bkMsg');if(!m)return;
+m.style.color='#d29922';m.textContent='⏳ 正在触发备份...';
+const d=await j('/backup/run',{method:'POST'});
+if(!d)return;
+if(d.ok){m.style.color='#3fb950';m.textContent='✅ 已创建备份 Job: '+esc(d.jobName);loadBkJobs();}
+else{m.style.color='#f85149';m.textContent='❌ '+esc(d.error||'触发失败');}
+}
+async function loadBkJobs(){
+const d=await j('/backup/jobs');if(!d||!d.jobs)return;const el=document.getElementById('bkJobs');
+if(!el)return;
+const rows=d.jobs.map(x=>{
+const st=x.state==='success'?'<span class=ok>成功</span>':(x.state==='failed'?'<span class=err>失败</span>':'<span class=small>进行中</span>');
+return '<div class=row><span class=small>'+esc((x.name||'').slice(0,30))+'</span><span class=small>'+esc((x.created||'').slice(0,16).replace('T',' '))+'</span>'+st+'</div>';
+}).join('');
+el.innerHTML='<div class=small style="margin-top:6px">最近备份：</div>'+rows;
 }
 async function act(kind){const btn=document.querySelectorAll('button');btn.forEach(b=>b.disabled=true);
 const msg=document.getElementById('msg');
@@ -264,12 +614,12 @@ try{const r=await fetch('/'+kind,{method:'POST'});
 if(r.status===401){msg.style.color='#f85149';msg.textContent='⚠️ 登录已过期，正在跳转登录...';setTimeout(()=>window.location=LOGIN_URL,800);return;}
 const s=await r.json();
 if(s && s.ok){msg.style.color='#3fb950';msg.textContent=(kind==='pause'?'✅ 已全部暂停':'✅ 已全部恢复');await load();}
-else if(s&&s.errors&&s.errors.length){msg.style.color='#f85149';msg.textContent='部分失败: '+escapeHtml(s.errors.join(' | '));}
-else{msg.style.color='#f85149';msg.textContent='操作失败: '+escapeHtml((s&&s.error)||'HTTP '+r.status);}}
-catch(e){msg.style.color='#f85149';msg.textContent='请求错误: '+escapeHtml(e.message);}
+else if(s&&s.errors&&s.errors.length){msg.style.color='#f85149';msg.textContent='部分失败: '+esc(s.errors.join(' | '));}
+else{msg.style.color='#f85149';msg.textContent='操作失败: '+esc((s&&s.error)||'HTTP '+r.status);}}
+catch(e){msg.style.color='#f85149';msg.textContent='请求错误: '+esc(e.message);}
 btn.forEach(b=>b.disabled=false);}
 window.onload=load;
-function escapeHtml(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 </script></body></html>`);
 });
 
@@ -278,74 +628,51 @@ function escapeHtml(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, m
 /* ---------- GitHub OAuth ---------- */
 app.get('/auth/login', (req, res) => {
   if (!GITHUB_CLIENT_ID || !GITHUB_CALLBACK_URL) {
-    return res.status(500).send('<h3>GitHub OAuth 未配置</h3><p>请先在 Sealos 环境变量中设置 GITHUB_CLIENT_ID 和 GITHUB_CALLBACK_URL，然后重新部署。</p>');
+    return res.status(500).send('GitHub OAuth 未配置（GITHUB_CLIENT_ID / CALLBACK_URL）');
   }
   const state = crypto.randomBytes(16).toString('hex');
   req.session.oauthState = state;
-  const params = new URLSearchParams({
-    client_id: GITHUB_CLIENT_ID,
-    redirect_uri: GITHUB_CALLBACK_URL,
-    scope: 'read:user',
-    state,
-    prompt: 'consent',      // 每次授权都弹确认框（即使已授权过）
-    force_login: true        // 强制重新输入 GitHub 密码（即使浏览器已登录）
-  });
+  const params = new URLSearchParams({ client_id: GITHUB_CLIENT_ID, redirect_uri: GITHUB_CALLBACK_URL, scope: 'read:user', state });
   res.redirect('https://github.com/login/oauth/authorize?' + params.toString());
 });
 
 app.get('/auth/callback', async (req, res) => {
   const { code, state } = req.query;
-  if (state !== req.session.oauthState) {
-    return res.status(400).send('OAuth state 不匹配，请重试');
+  if (!code) return res.status(400).send('缺少 code');
+  if (state && req.session && req.session.oauthState && state !== req.session.oauthState) {
+    return res.status(400).send('state 不匹配，可能被 CSRF');
   }
   try {
-    const tokRes = await fetch('https://github.com/login/oauth/access_token', {
+    const tokenRes = await fetch('https://github.com/login/oauth/access_token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({ client_id: GITHUB_CLIENT_ID, client_secret: GITHUB_CLIENT_SECRET, code, redirect_uri: GITHUB_CALLBACK_URL })
     });
-    const tok = await tokRes.json();
-    if (!tok.access_token) return res.status(400).send('获取 access_token 失败: ' + (tok.error_description || tok.error || ''));
-    const userRes = await fetch('https://api.github.com/user', {
-      headers: { Authorization: 'token ' + tok.access_token, Accept: 'application/vnd.github+json' }
-    });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.access_token) throw new Error('获取 token 失败: ' + (tokenData.error_description || tokenData.error));
+    const userRes = await fetch('https://api.github.com/user', { headers: { Authorization: 'Bearer ' + tokenData.access_token } });
     const user = await userRes.json();
-    if (user.login !== ALLOWED_GITHUB_LOGIN) {
-      return res.status(403).send('账号 ' + user.login + ' 不在白名单内，禁止访问');
+    if (!ALLOWED_GITHUB_LOGIN.includes(user.login)) {
+      return res.status(403).send('账号 ' + user.login + ' 不在白名单内');
     }
-    req.session.user = { login: user.login, name: user.name || user.login };
-    // 若 TOTP 已启用且本会话未验证，先跳动态码验证
-    if (TOTP_SECRET && !req.session.totpVerified) {
-      return res.redirect('/totp/verify');
-    }
+    req.session.user = { login: user.login, name: user.name };
     res.redirect('/');
   } catch (e) {
-    res.status(500).send('OAuth 回调处理失败: ' + e.message);
+    res.status(500).send('GitHub 登录失败: ' + e.message);
   }
 });
 
-/* favicon：返回 204，避免 404 刷屏 */
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
-/* 退出：清 cookie + 销毁 session，跳本地"已退出"页（不跳 GitHub，避免自动登回） */
 app.get('/logout', (req, res) => {
-  req.session.destroy(() => {
-    res.clearCookie('connect.sid');
-    res.redirect('/logged-out');
-  });
+  req.session.destroy(() => res.redirect('/logged-out'));
 });
 
-/* 已退出页：明确显示退出成功，刷新仍停留此页；点"重新登录"/访问面板才走 OAuth 重验 */
 app.get('/logged-out', (req, res) => {
-  res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>已退出</title>
-<style>body{font-family:system-ui,sans-serif;max-width:480px;margin:60px auto;padding:0 16px;background:#0f1115;color:#e6e8eb;text-align:center}h1{font-size:22px}.ok{color:#3fb950;font-size:44px}.btn{display:inline-block;margin-top:24px;padding:12px 28px;background:#2ea043;color:#fff;text-decoration:none;border-radius:8px;font-size:16px}.tip{color:#8b949e;font-size:14px;margin-top:16px}</style></head>
-<body><div class="ok">✓</div><h1>您已安全退出</h1>
-<p>登录状态已清除，刷新本页仍停留在退出状态。</p>
-<a class="btn" href="${AUTH_MODE === 'totp' ? '/totp/verify' : '/auth/login'}">重新登录</a>
-<div class="tip">${AUTH_MODE === 'totp' ? '重新登录需输入动态验证码' : '重新登录需输入 GitHub 密码 + 动态验证码'}</div></body></html>`);
+  res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>已退出</title></head><body style="font-family:system-ui;background:#0f1115;color:#e6e8eb;padding:40px"><h2>已退出登录</h2><p><a href="/" style="color:#3fb950">重新登录</a></p></body></html>`);
 });
 
-/* ---------- 4 个业务端点 ---------- */
+/* ================= API: 资源展示 ================= */
 app.get('/status', requireAuth, requireTotp, async (req, res) => {
   try {
     const state = readState();
@@ -356,6 +683,120 @@ app.get('/status', requireAuth, requireTotp, async (req, res) => {
   }
 });
 
+app.get('/resources', requireAuth, requireTotp, async (req, res) => {
+  try {
+    const resources = [];
+    for (const t of MODE_TARGETS) {
+      try {
+        const full = await kubeGetFull(t.kind, t.name);
+        resources.push({ label: t.label, name: full.name, kind: full.kind, resources: full.resources, replicas: full.ready });
+      } catch (e) {
+        resources.push({ label: t.label, name: t.name, kind: t.kind, resources: null, error: e.message });
+      }
+    }
+    // PVC：按 StatefulSet 名称匹配（约定 PVC 名 = StatefulSet 名）
+    const pvcs = [];
+    for (const t of MODE_TARGETS) {
+      try {
+        const pvc = await kubeGetPVC(t.name);
+        pvcs.push(pvc);
+      } catch (e) { /* 忽略单个 PVC 失败 */ }
+    }
+    res.json({ resources, pvcs });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ================= API: 模式配置与管理 ================= */
+app.get('/modes', requireAuth, requireTotp, async (req, res) => {
+  const { modes, activeMode } = getModeConfig();
+  res.json({ modes, activeMode });
+});
+
+// 保存模式配置（页面可编辑各模式数值）
+app.post('/modes', requireAuth, requireTotp, async (req, res) => {
+  try {
+    const { modes, activeMode } = req.body || {};
+    if (!modes || typeof modes !== 'object') return res.status(400).json({ error: 'modes 参数缺失' });
+    // 只允许三类 key
+    const allowed = ['daily', 'pro', 'develop'];
+    const clean = {};
+    for (const k of allowed) {
+      if (modes[k]) {
+        const m = modes[k];
+        const cfg = {};
+        for (const tkey of ['lobehub', 'devbox']) {
+          const c = m.configs && m.configs[tkey];
+          if (c && c.cpu && c.mem) cfg[tkey] = { cpu: String(c.cpu), mem: String(c.mem) };
+        }
+        clean[k] = { label: m.label || k, desc: m.desc || '', configs: cfg };
+      }
+    }
+    saveModeConfig(clean, activeMode || undefined);
+    res.json({ ok: true, modes: clean });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 切换模式（分步确认 + 失败回滚）
+app.post('/mode', requireAuth, requireTotp, async (req, res) => {
+  try {
+    const { mode } = req.body || {};
+    if (!mode) return res.status(400).json({ error: 'mode 参数缺失' });
+    const result = await switchMode(mode);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message, rollback: true });
+  }
+});
+
+/* ================= API: 数据库备份 ================= */
+app.get('/backup', requireAuth, requireTotp, async (req, res) => {
+  try {
+    const config = getBackupConfig();
+    res.json({ config });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/backup', requireAuth, requireTotp, async (req, res) => {
+  try {
+    const { enabled, times } = req.body || {};
+    const cur = getBackupConfig();
+    const bc = {
+      enabled: typeof enabled === 'boolean' ? enabled : cur.enabled,
+      times: Array.isArray(times) ? times.map(s => String(s).trim()).filter(t => /^\\d{1,2}:\\d{2}$/.test(t)) : cur.times
+    };
+    saveBackupConfig(bc);
+    scheduleBackups();
+    res.json({ ok: true, config: bc });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/backup/run', requireAuth, requireTotp, async (req, res) => {
+  try {
+    const jobName = await triggerBackup();
+    res.json({ ok: true, jobName });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/backup/jobs', requireAuth, requireTotp, async (req, res) => {
+  try {
+    const jobs = await listBackupJobs();
+    res.json({ jobs });
+  } catch (e) {
+    res.json({ jobs: [], error: e.message });
+  }
+});
+
+/* ================= 暂停/恢复 ================= */
 app.post('/pause', requireAuth, requireTotp, async (req, res) => {
   if (!APPS_CONFIG.length) return res.status(400).json({ error: 'APPS_CONFIG 为空，无法暂停' });
   const state = readState();
@@ -402,4 +843,8 @@ app.listen(PORT, () => {
   if (!process.env.SESSION_SECRET) {
     console.log('[warn] SESSION_SECRET 未设置，每次重启后需重新登录');
   }
+  // 初始化 & 调度备份
+  getModeConfig();
+  getBackupConfig();
+  scheduleBackups();
 });
