@@ -339,10 +339,17 @@ function saveBackupConfig(bc) {
 async function getBackupCronJobEnv() {
   const url = `${KUBE_API_SERVER}/apis/batch/v1/namespaces/${BACKUP_NAMESPACE}/cronjobs/${BACKUP_CRONJOB}`;
   const data = await kubeRequest('GET', url);
-  const c = data.spec && data.spec.jobTemplate && data.spec.jobTemplate.spec && data.spec.jobTemplate.spec.template && data.spec.jobTemplate.spec.template.spec && data.spec.jobTemplate.spec.template.spec.containers;
-  const container = c && c[0];
+  const podSpec = data.spec && data.spec.jobTemplate && data.spec.jobTemplate.spec && data.spec.jobTemplate.spec.template && data.spec.jobTemplate.spec.template.spec;
+  const container = podSpec && podSpec.containers && podSpec.containers[0];
   if (!container) throw new Error('未找到 CronJob 容器定义');
-  return { image: container.image, env: container.env || [], command: container.command, args: container.args };
+  return {
+    image: container.image,
+    env: container.env || [],
+    command: container.command,
+    args: container.args,
+    imagePullSecrets: (podSpec.imagePullSecrets || []).map(s => ({ name: s.name })),
+    serviceAccountName: podSpec.serviceAccountName
+  };
 }
 
 // 触发一次备份（创建一次性 Job）
@@ -360,6 +367,8 @@ async function triggerBackup() {
       template: {
         spec: {
           restartPolicy: 'Never',
+          imagePullSecrets: tpl.imagePullSecrets,
+          serviceAccountName: tpl.serviceAccountName,
           containers: [{
             name: 'backup',
             image: tpl.image,
