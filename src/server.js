@@ -26,6 +26,17 @@ const APPS_CONFIG = parseApps(process.env.APPS_CONFIG || '[]');
 const STATE_FILE = process.env.STATE_FILE || '/data/state.json';
 const BACKUP_CRONJOB = process.env.BACKUP_CRONJOB || 'pg17-backup-1-2';
 const BACKUP_NAMESPACE = process.env.BACKUP_NAMESPACE || KUBE_NAMESPACE;
+// 面板自备备份配置（优先）：配了就不再依赖 CronJob 动态读取
+const BACKUP_IMAGE = process.env.BACKUP_IMAGE || '';
+const BACKUP_PULL_SECRET = process.env.BACKUP_PULL_SECRET || '';
+// 面板自备备份环境变量（在 Sealos 环境变量里逐条配置，与 CronJob 同款命名）
+const PANEL_BACKUP_ENV = [
+  ['PG_URI', process.env.PG_URI],
+  ['S3_URI', process.env.S3_URI],
+  ['S3_BUCK', process.env.S3_BUCK],
+  ['S3_NAME', process.env.S3_NAME],
+  ['TZ', process.env.TZ || 'Asia/Shanghai']
+].filter(([k, v]) => v).map(([name, value]) => ({ name, value }));
 
 // 模式切换针对的两个维度应用（lobe 主服务 + devbox）
 const MODE_TARGETS = [
@@ -337,6 +348,18 @@ function saveBackupConfig(bc) {
 
 // 读取现有 CronJob 的 env（复用它，凭证不落地面板存储）
 async function getBackupCronJobEnv() {
+  // 优先：面板自备配置（BACKUP_IMAGE + 面板环境变量 PG_URI/S3_URI/S3_BUCK/S3_NAME/TZ）
+  if (BACKUP_IMAGE) {
+    return {
+      image: BACKUP_IMAGE,
+      env: PANEL_BACKUP_ENV,
+      command: undefined,
+      args: undefined,
+      imagePullSecrets: BACKUP_PULL_SECRET ? [{ name: BACKUP_PULL_SECRET }] : [],
+      serviceAccountName: undefined
+    };
+  }
+  // 兜底：从 CronJob 动态读取
   const url = `${KUBE_API_SERVER}/apis/batch/v1/namespaces/${BACKUP_NAMESPACE}/cronjobs/${BACKUP_CRONJOB}`;
   const data = await kubeRequest('GET', url);
   const podSpec = data.spec && data.spec.jobTemplate && data.spec.jobTemplate.spec && data.spec.jobTemplate.spec.template && data.spec.jobTemplate.spec.template.spec;
