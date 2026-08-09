@@ -50,7 +50,7 @@ rules:
   - lobehub-paradedb
   - my-devbox
   - device-gateway
-# 3. PVC 读取（资源展示）
+# 3. PVC 读取（资源展示）——Sealos 会给 PVC 加 vn- 前缀，故不锁 resourceNames，仅 namespace 内只读
 - apiGroups:
   - ""
   resources:
@@ -58,11 +58,6 @@ rules:
   verbs:
   - get
   - list
-  resourceNames:
-  - lobehub-v2
-  - lobehub-paradedb
-  - my-devbox
-  - device-gateway
 # 4. 数据库备份（batch）
 - apiGroups:
   - batch

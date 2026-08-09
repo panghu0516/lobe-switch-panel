@@ -156,7 +156,7 @@ async function kubeGetFull(kind, name) {
   };
 }
 
-// 读取 PVC 容量/用量
+// 读取 PVC 容量/用量（按实际名）
 async function kubeGetPVC(pvcName) {
   const url = `${KUBE_API_SERVER}/api/v1/namespaces/${KUBE_NAMESPACE}/persistentvolumeclaims/${pvcName}`;
   const data = await kubeRequest('GET', url);
@@ -166,6 +166,25 @@ async function kubeGetPVC(pvcName) {
     capacity: cap && cap.storage ? cap.storage : (data.spec.resources && data.spec.resources.requests && data.spec.resources.requests.storage),
     phase: data.status && data.status.phase
   };
+}
+
+// 从 StatefulSet 的 volumeClaimTemplates 动态推导 PVC 名（Sealos 会给 claimName 加 vn- 前缀）
+// PVC 实际名 = {claimTemplate.name}-{statefulset.name}-{ordinal}，ordinal 取 0
+async function kubeGetPVCFromSTS(kind, name) {
+  const data = await kubeRequest('GET', kubeUrl(kind, name));
+  const templates = (data.spec && data.spec.volumeClaimTemplates) || [];
+  const pvcs = [];
+  for (const tpl of templates) {
+    const claim = tpl.metadata.name;
+    const pvcName = `${claim}-${name}-0`;
+    try {
+      const pvc = await kubeGetPVC(pvcName);
+      pvcs.push(pvc);
+    } catch (e) {
+      pvcs.push({ name: pvcName, error: e.message });
+    }
+  }
+  return pvcs;
 }
 
 // 精细 patch 单个容器的 resources
@@ -694,13 +713,13 @@ app.get('/resources', requireAuth, requireTotp, async (req, res) => {
         resources.push({ label: t.label, name: t.name, kind: t.kind, resources: null, error: e.message });
       }
     }
-    // PVC：按 StatefulSet 名称匹配（约定 PVC 名 = StatefulSet 名）
+    // PVC：从 StatefulSet volumeClaimTemplates 动态推导
     const pvcs = [];
     for (const t of MODE_TARGETS) {
       try {
-        const pvc = await kubeGetPVC(t.name);
-        pvcs.push(pvc);
-      } catch (e) { /* 忽略单个 PVC 失败 */ }
+        const list = await kubeGetPVCFromSTS(t.kind, t.name);
+        pvcs.push(...list);
+      } catch (e) { /* 忽略单个 StatefulSet PVC 失败 */ }
     }
     res.json({ resources, pvcs });
   } catch (e) {
