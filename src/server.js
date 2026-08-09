@@ -576,7 +576,7 @@ const btns=keys.map(k=>{
 const m=d.modes[k];const c=m.configs;
 const cpuL=c.lobehub?c.lobehub.cpu:'-',memL=c.lobehub?c.lobehub.mem:'-';
 const cpuD=c.devbox?c.devbox.cpu:'-',memD=c.devbox?c.devbox.mem:'-';
-return '<button class="mode-btn" data-active="'+(d.activeMode===k?1:0)+'" onclick="switchMode(\''+k+'\')" title="'+esc(m.desc)+'">'+esc(m.label)+'<br><span class=small>Lobe '+esc(cpuL)+'/'+esc(memL)+' · Dev '+esc(cpuD)+'/'+esc(memD)+'</span></button>';
+return '<button class="mode-btn" data-active="'+(d.activeMode===k?1:0)+'" onclick="switchMode(\\'+k+\\')" title="'+esc(m.desc)+'">'+esc(m.label)+'<br><span class=small>Lobe '+esc(cpuL)+'/'+esc(memL)+' · Dev '+esc(cpuD)+'/'+esc(memD)+'</span></button>';
 }).join('');
 el.innerHTML=btns+'<div id="modeMsg" class=small></div>';
 }
