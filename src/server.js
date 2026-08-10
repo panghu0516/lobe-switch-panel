@@ -26,6 +26,9 @@ const APPS_CONFIG = parseApps(process.env.APPS_CONFIG || '[]');
 const STATE_FILE = process.env.STATE_FILE || '/data/state.json';
 const BACKUP_CRONJOB = process.env.BACKUP_CRONJOB || 'pg17-backup-1-2';
 const BACKUP_NAMESPACE = process.env.BACKUP_NAMESPACE || KUBE_NAMESPACE;
+// 备份调度的环境变量兜底（state.json 缺失时作为默认值；页面保存后以 state.json 为准）
+const BACKUP_ENABLED_ENV = process.env.BACKUP_ENABLED;
+const BACKUP_TIMES_ENV = (process.env.BACKUP_TIMES || '').split(',').map(s => s.trim()).filter(Boolean);
 // 面板自备备份配置（优先）：配了就不再依赖 CronJob 动态读取
 const BACKUP_IMAGE = process.env.BACKUP_IMAGE || '';
 const BACKUP_PULL_SECRET = process.env.BACKUP_PULL_SECRET || '';
@@ -45,11 +48,28 @@ const MODE_TARGETS = [
 ];
 
 // 三套默认模式（cpu / mem 均指 requests 与 limits 一致）
-const DEFAULT_MODES = {
-  daily: { label: '日常', desc: '轻量日常运维', configs: { lobehub: { cpu: '200m', mem: '2Gi' }, devbox: { cpu: '200m', mem: '0.5Gi' } } },
-  pro:   { label: '并发 Pro', desc: '高并发运行', configs: { lobehub: { cpu: '500m', mem: '2Gi' }, devbox: { cpu: '500m', mem: '1Gi' } } },
-  develop: { label: '开发 Max', desc: '开发编译模式', configs: { lobehub: { cpu: '500m', mem: '2Gi' }, devbox: { cpu: '1', mem: '2Gi' } } }
-};
+// 支持环境变量覆盖默认值：MODE_<KEY>_<TARGET>_<FIELD>
+//   KEY: DAILY | PRO | DEVELOP，TARGET: LOBEHUB | DEVBOX，FIELD: CPU | MEM
+//   例：MODE_DEVELOP_DEVBOX_MEM=3Gi  MODE_DAILY_LOBE_CPU=300m
+function defaultModesFromEnv() {
+  const defaults = {
+    daily: { label: '日常', desc: '轻量日常运维', configs: { lobehub: { cpu: '200m', mem: '2Gi' }, devbox: { cpu: '200m', mem: '0.5Gi' } } },
+    pro:   { label: '并发 Pro', desc: '高并发运行', configs: { lobehub: { cpu: '500m', mem: '2Gi' }, devbox: { cpu: '500m', mem: '1Gi' } } },
+    develop: { label: '开发 Max', desc: '开发编译模式', configs: { lobehub: { cpu: '1', mem: '2Gi' }, devbox: { cpu: '1', mem: '2Gi' } } }
+  };
+  const out = JSON.parse(JSON.stringify(defaults));
+  for (const k of Object.keys(out)) {
+    for (const t of Object.keys(out[k].configs)) {
+      for (const f of Object.keys(out[k].configs[t])) {
+        const envKey = 'MODE_' + k.toUpperCase() + '_' + t.toUpperCase() + '_' + f.toUpperCase();
+        const v = process.env[envKey];
+        if (v && String(v).trim()) out[k].configs[t][f] = String(v).trim();
+      }
+    }
+  }
+  return out;
+}
+const DEFAULT_MODES = defaultModesFromEnv();
 
 let kubeAgent = null;
 const KUBE_CA_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt';
@@ -84,10 +104,24 @@ function writeState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
+// 判断模式配置是否完整（三套模式 × lobehub/devbox × cpu/mem 齐全）
+function modesComplete(modes) {
+  if (!modes || typeof modes !== 'object') return false;
+  for (const k of ['daily', 'pro', 'develop']) {
+    const m = modes[k];
+    if (!m || !m.configs || !m.configs.lobehub || !m.configs.devbox) return false;
+    for (const t of ['lobehub', 'devbox']) {
+      const c = m.configs[t];
+      if (!c || !String(c.cpu || '').trim() || !String(c.mem || '').trim()) return false;
+    }
+  }
+  return true;
+}
+
 // 读取或初始化模式配置（存于 state.json）
 function getModeConfig() {
   const s = readState();
-  if (!s.modes || !s.modes.daily || !s.modes.develop) {
+  if (!modesComplete(s.modes)) {
     s.modes = JSON.parse(JSON.stringify(DEFAULT_MODES));
     s.activeMode = s.activeMode || 'daily';
     writeState(s);
@@ -335,7 +369,11 @@ async function kubeVerifyResources(kind, name, expect) {
 function getBackupConfig() {
   const s = readState();
   if (!s.backup) {
-    s.backup = { enabled: true, times: ['12:00', '15:00', '19:00', '23:00'] };
+    const envEnabled = BACKUP_ENABLED_ENV === undefined ? true : (BACKUP_ENABLED_ENV !== 'false' && BACKUP_ENABLED_ENV !== '0');
+    s.backup = {
+      enabled: envEnabled,
+      times: BACKUP_TIMES_ENV.length ? BACKUP_TIMES_ENV.slice() : ['12:00', '15:00', '19:00', '23:00']
+    };
     writeState(s);
   }
   return s.backup;
@@ -559,6 +597,8 @@ app.get('/', (req, res) => {
 <h2>🎛 模式切换</h2>
 <div id="modes"></div>
 <div id="modeMsg" class="small" style="margin-top:8px"></div>
+<div style="margin-top:10px"><button class="mode-btn" onclick="toggleModeEdit()">⚙️ 编辑模式数值</button></div>
+<div id="modeEdit" style="display:none;margin-top:10px"></div>
 </div>
 
 <div class="card">
@@ -601,16 +641,58 @@ return '<div class=row><span><b>'+esc(x.label)+'</b> <span class=small>('+esc(x.
 const pVs=(d.pvcs||[]).map(p=>'<span class=tag>'+esc(p.name)+' 容量 '+esc(p.capacity||'-')+'</span>').join('');
 el.innerHTML=r+(pVs?'<div class=small style="margin-top:8px">持久卷: '+pVs+'</div>':'');
 }
+let MODE_META={};
 async function loadModes(){
 const d=await j('/modes');if(!d||!d.modes)return;const el=document.getElementById('modes');
-const keys=Object.keys(d.modes);
+const keys=Object.keys(d.modes);MODE_META={};
 const btns=keys.map(k=>{
 const m=d.modes[k];const c=m.configs;
+MODE_META[k]={label:m.label,desc:m.desc};
 const cpuL=c.lobehub?c.lobehub.cpu:'-',memL=c.lobehub?c.lobehub.mem:'-';
 const cpuD=c.devbox?c.devbox.cpu:'-',memD=c.devbox?c.devbox.mem:'-';
-return '<button class="mode-btn" data-active="'+(d.activeMode===k?1:0)+'" onclick="switchMode(\\'+k+\\')" title="'+esc(m.desc)+'">'+esc(m.label)+'<br><span class=small>Lobe '+esc(cpuL)+'/'+esc(memL)+' · Dev '+esc(cpuD)+'/'+esc(memD)+'</span></button>';
+return '<button class="mode-btn" data-active="'+(d.activeMode===k?1:0)+'" data-mode="'+esc(k)+'" onclick="switchMode(this.dataset.mode)" title="'+esc(m.desc)+'">'+esc(m.label)+'<br><span class=small>Lobe '+esc(cpuL)+'/'+esc(memL)+' · Dev '+esc(cpuD)+'/'+esc(memD)+'</span></button>';
 }).join('');
 el.innerHTML=btns+'<div id="modeMsg" class=small></div>';
+renderModeEdit(d.modes);
+}
+function renderModeEdit(modes){
+const el=document.getElementById('modeEdit');if(!el)return;
+const keys=Object.keys(modes);
+const field=(k,t,f)=>{const c=modes[k].configs[t]||{};return '<input data-me="'+k+'-'+t+'-'+f+'" type="text" value="'+esc(c[f]||'')+'" style="width:76px" title="'+esc(k+'/'+t+'/'+f)+'">';};
+el.innerHTML='<div class="small" style="margin-bottom:6px">调整各模式 LobeHub / Devbox 的 CPU 与内存（requests=limits）。保存后点击对应模式按钮即生效；若面板重启丢失，请用环境变量 MODE_DAILY_LOBE_CPU 等设置默认值。</div>'+
+keys.map(k=>{const m=modes[k];return '<div class="row"><span><b>'+esc(m.label)+'</b> <span class=small>'+esc(m.desc)+'</span></span>'+
+'<span class="small mono">Lobe CPU '+field(k,'lobehub','cpu')+' MEM '+field(k,'lobehub','mem')+'</span>'+
+'<span class="small mono">Dev CPU '+field(k,'devbox','cpu')+' MEM '+field(k,'devbox','mem')+'</span></div>';}).join('')+
+'<div style="margin-top:8px"><button class="mode-btn" onclick="saveModes()">💾 保存模式配置</button> <button class="mode-btn" onclick="resetModes()">↩️ 恢复默认</button></div>'+
+'<div id="modeEditMsg" class="small" style="margin-top:6px"></div>';
+}
+function toggleModeEdit(){
+const el=document.getElementById('modeEdit');if(!el)return;
+el.style.display=el.style.display==='none'?'block':'none';
+}
+async function saveModes(){
+const modes={};
+document.querySelectorAll('[data-me]').forEach(el=>{
+const p=el.dataset.me.split('-');const k=p[0],t=p[1],f=p[2];
+if(!modes[k]){const meta=MODE_META[k]||{};modes[k]={label:meta.label||k,desc:meta.desc||'',configs:{}};}
+if(!modes[k].configs[t])modes[k].configs[t]={};
+modes[k].configs[t][f]=el.value.trim();
+});
+const m=document.getElementById('modeEditMsg');if(!m)return;
+m.style.color='#d29922';m.textContent='⏳ 保存中...';
+const d=await j('/modes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({modes})});
+if(!d)return;
+if(d.ok){m.style.color='#3fb950';m.textContent='✅ 模式配置已保存（点击对应模式按钮即应用）';await loadModes();}
+else{m.style.color='#f85149';m.textContent='❌ '+esc(d.error||'保存失败');}
+}
+async function resetModes(){
+const m=document.getElementById('modeEditMsg');if(!m)return;
+if(!confirm('恢复为环境变量/内置默认模式数值？'))return;
+m.style.color='#d29922';m.textContent='⏳ 恢复中...';
+const d=await j('/modes/reset',{method:'POST'});
+if(!d)return;
+if(d.ok){m.style.color='#3fb950';m.textContent='✅ 已恢复默认模式配置';await loadModes();}
+else{m.style.color='#f85149';m.textContent='❌ '+esc(d.error||'恢复失败');}
 }
 async function switchMode(k){
 const m=document.getElementById('modeMsg');if(!m)return;
@@ -639,7 +721,8 @@ enabled:document.getElementById('bkEnabled').checked,
 times:document.getElementById('bkTimes').value.split('\\n').map(s=>s.trim()).filter(Boolean)
 })});
 const m=document.getElementById('bkMsg');if(!d||!m)return;
-m.style.color=d.ok?'#3fb950':'#f85149';m.textContent=d.ok?'✅ 备份配置已保存':'❌ '+esc(d.error||'保存失败');
+if(d.ok){m.style.color='#3fb950';m.textContent='✅ 备份配置已保存：'+esc((d.config&&d.config.times||[]).join(', '));await loadBackup();}
+else{m.style.color='#f85149';m.textContent='❌ '+esc(d.error||'保存失败');}
 }
 async function runBk(){
 const m=document.getElementById('bkMsg');if(!m)return;
@@ -770,22 +853,38 @@ app.post('/modes', requireAuth, requireTotp, async (req, res) => {
   try {
     const { modes, activeMode } = req.body || {};
     if (!modes || typeof modes !== 'object') return res.status(400).json({ error: 'modes 参数缺失' });
-    // 只允许三类 key
+    // 只允许三类 key，且要求三套都完整（否则下次读取会被重置为默认）
     const allowed = ['daily', 'pro', 'develop'];
     const clean = {};
     for (const k of allowed) {
-      if (modes[k]) {
-        const m = modes[k];
-        const cfg = {};
-        for (const tkey of ['lobehub', 'devbox']) {
-          const c = m.configs && m.configs[tkey];
-          if (c && c.cpu && c.mem) cfg[tkey] = { cpu: String(c.cpu), mem: String(c.mem) };
+      const m = modes[k];
+      if (!m) return res.status(400).json({ error: '模式 ' + k + ' 缺失，请提供完整三套模式' });
+      const cfg = {};
+      for (const tkey of ['lobehub', 'devbox']) {
+        const c = m.configs && m.configs[tkey];
+        if (!c || !String(c.cpu || '').trim() || !String(c.mem || '').trim()) {
+          return res.status(400).json({ error: '模式 ' + k + ' 的 ' + tkey + ' CPU/内存 不能为空' });
         }
-        clean[k] = { label: m.label || k, desc: m.desc || '', configs: cfg };
+        cfg[tkey] = { cpu: String(c.cpu).trim(), mem: String(c.mem).trim() };
       }
+      clean[k] = { label: m.label || k, desc: m.desc || '', configs: cfg };
     }
     saveModeConfig(clean, activeMode || undefined);
     res.json({ ok: true, modes: clean });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 恢复默认模式配置（回到环境变量/内置默认值）
+app.post('/modes/reset', requireAuth, requireTotp, async (req, res) => {
+  try {
+    const s = readState();
+    delete s.modes;
+    delete s.activeMode;
+    writeState(s);
+    const { modes, activeMode } = getModeConfig();
+    res.json({ ok: true, modes, activeMode });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -817,9 +916,21 @@ app.post('/backup', requireAuth, requireTotp, async (req, res) => {
   try {
     const { enabled, times } = req.body || {};
     const cur = getBackupConfig();
+    let cleanTimes = cur.times;
+    if (times !== undefined) {
+      if (!Array.isArray(times)) return res.status(400).json({ error: 'times 必须是数组' });
+      const t = times.map(s => String(s).trim()).filter(Boolean);
+      const bad = t.filter(x => {
+        const m = /^(\d{1,2}):(\d{2})$/.exec(x);
+        if (!m) return true;
+        return parseInt(m[1], 10) > 23 || parseInt(m[2], 10) > 59;
+      });
+      if (bad.length) return res.status(400).json({ error: '时间格式错误（应为 00:00-23:59，如 03:30）：' + bad.join(', ') });
+      cleanTimes = t;
+    }
     const bc = {
       enabled: typeof enabled === 'boolean' ? enabled : cur.enabled,
-      times: Array.isArray(times) ? times.map(s => String(s).trim()).filter(t => /^\\d{1,2}:\\d{2}$/.test(t)) : cur.times
+      times: cleanTimes
     };
     saveBackupConfig(bc);
     scheduleBackups();
