@@ -41,21 +41,23 @@ const PANEL_BACKUP_ENV = [
   ['TZ', process.env.TZ || 'Asia/Shanghai']
 ].filter(([k, v]) => v).map(([name, value]) => ({ name, value }));
 
-// 模式切换针对的两个维度应用（lobe 主服务 + devbox）
+// 模式切换针对的三个维度应用（lobe 主服务 + devbox + paradedb 数据库）
 const MODE_TARGETS = [
   { kind: 'StatefulSet', name: 'lobehub-v2', label: 'LobeHub' },
-  { kind: 'StatefulSet', name: 'my-devbox', label: 'Devbox' }
+  { kind: 'StatefulSet', name: 'my-devbox', label: 'Devbox' },
+  { kind: 'StatefulSet', name: 'lobehub-paradedb', label: 'ParadeDB' }
 ];
 
 // 三套默认模式（cpu / mem 均指 requests 与 limits 一致）
 // 支持环境变量覆盖默认值：MODE_<KEY>_<TARGET>_<FIELD>
-//   KEY: DAILY | PRO | DEVELOP，TARGET: LOBEHUB | DEVBOX，FIELD: CPU | MEM
-//   例：MODE_DEVELOP_DEVBOX_MEM=3Gi  MODE_DAILY_LOBE_CPU=300m
+//   KEY: DAILY | PRO | DEVELOP，TARGET: LOBEHUB | DEVBOX | PARADEDB，FIELD: CPU | MEM
+//   例：MODE_DEVELOP_DEVBOX_MEM=3Gi  MODE_DAILY_LOBE_CPU=300m  MODE_PRO_PARADEDB_MEM=2Gi
 function defaultModesFromEnv() {
   const defaults = {
-    daily: { label: '日常', desc: '轻量日常运维', configs: { lobehub: { cpu: '200m', mem: '2Gi' }, devbox: { cpu: '200m', mem: '0.5Gi' } } },
-    pro:   { label: '并发 Pro', desc: '高并发运行', configs: { lobehub: { cpu: '500m', mem: '2Gi' }, devbox: { cpu: '500m', mem: '1Gi' } } },
-    develop: { label: '开发 Max', desc: '开发编译模式', configs: { lobehub: { cpu: '1', mem: '2Gi' }, devbox: { cpu: '1', mem: '2Gi' } } }
+    // 注：paradedb 为数据库，建议三套模式保持一致或接近实际配置，避免切换触发滚动重启
+    daily: { label: '日常', desc: '轻量日常运维', configs: { lobehub: { cpu: '200m', mem: '2Gi' }, devbox: { cpu: '200m', mem: '0.5Gi' }, paradedb: { cpu: '500m', mem: '1Gi' } } },
+    pro:   { label: '并发 Pro', desc: '高并发运行', configs: { lobehub: { cpu: '500m', mem: '2Gi' }, devbox: { cpu: '500m', mem: '1Gi' }, paradedb: { cpu: '500m', mem: '1Gi' } } },
+    develop: { label: '开发 Max', desc: '开发编译模式', configs: { lobehub: { cpu: '1', mem: '2Gi' }, devbox: { cpu: '1', mem: '2Gi' }, paradedb: { cpu: '500m', mem: '1Gi' } } }
   };
   const out = JSON.parse(JSON.stringify(defaults));
   for (const k of Object.keys(out)) {
@@ -104,13 +106,13 @@ function writeState(state) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
-// 判断模式配置是否完整（三套模式 × lobehub/devbox × cpu/mem 齐全）
+// 判断模式配置是否完整（三套模式 × lobehub/devbox/paradedb × cpu/mem 齐全）
 function modesComplete(modes) {
   if (!modes || typeof modes !== 'object') return false;
   for (const k of ['daily', 'pro', 'develop']) {
     const m = modes[k];
-    if (!m || !m.configs || !m.configs.lobehub || !m.configs.devbox) return false;
-    for (const t of ['lobehub', 'devbox']) {
+    if (!m || !m.configs || !m.configs.lobehub || !m.configs.devbox || !m.configs.paradedb) return false;
+    for (const t of ['lobehub', 'devbox', 'paradedb']) {
       const c = m.configs[t];
       if (!c || !String(c.cpu || '').trim() || !String(c.mem || '').trim()) return false;
     }
@@ -279,9 +281,9 @@ function buildResources(mem, cpu) {
   };
 }
 
-// key: 'lobehub' | 'devbox' -> 对应 MODE_TARGETS 里 name
+// key: 'lobehub' | 'devbox' | 'paradedb' -> 对应 MODE_TARGETS 里 name
 function targetFor(key) {
-  const nameMap = { lobehub: 'lobehub-v2', devbox: 'my-devbox' };
+  const nameMap = { lobehub: 'lobehub-v2', devbox: 'my-devbox', paradedb: 'lobehub-paradedb' };
   return MODE_TARGETS.find(t => t.name === nameMap[key]);
 }
 
@@ -289,11 +291,11 @@ async function switchMode(modeKey) {
   const { modes } = getModeConfig();
   const mode = modes[modeKey];
   if (!mode) throw new Error('未知模式: ' + modeKey);
-  const cfg = mode.configs; // { lobehub: {cpu,mem}, devbox: {cpu,mem} }
+  const cfg = mode.configs; // { lobehub: {cpu,mem}, devbox: {cpu,mem}, paradedb: {cpu,mem} }
 
   // 1. 存档当前 resources（用于回滚）
   const saved = {};
-  for (const key of ['lobehub', 'devbox']) {
+  for (const key of ['lobehub', 'devbox', 'paradedb']) {
     const t = targetFor(key);
     const cur = await kubeGetFull(t.kind, t.name);
     saved[key] = cur.resources;
@@ -303,7 +305,7 @@ async function switchMode(modeKey) {
   const applied = {};
   try {
     // 2. 依次应用
-    for (const key of ['lobehub', 'devbox']) {
+    for (const key of ['lobehub', 'devbox', 'paradedb']) {
       const t = targetFor(key);
       const c = cfg[key];
       await kubePatchResources(t.kind, t.name, buildResources(c.mem, c.cpu));
@@ -315,7 +317,7 @@ async function switchMode(modeKey) {
 
   // 3. 验证（轮询确认生效）
   if (errors.length === 0) {
-    for (const key of ['lobehub', 'devbox']) {
+    for (const key of ['lobehub', 'devbox', 'paradedb']) {
       try {
         const t = targetFor(key);
         const verify = await kubeVerifyResources(t.kind, t.name, cfg[key]);
@@ -650,7 +652,8 @@ const m=d.modes[k];const c=m.configs;
 MODE_META[k]={label:m.label,desc:m.desc};
 const cpuL=c.lobehub?c.lobehub.cpu:'-',memL=c.lobehub?c.lobehub.mem:'-';
 const cpuD=c.devbox?c.devbox.cpu:'-',memD=c.devbox?c.devbox.mem:'-';
-return '<button class="mode-btn" data-active="'+(d.activeMode===k?1:0)+'" data-mode="'+esc(k)+'" onclick="switchMode(this.dataset.mode)" title="'+esc(m.desc)+'">'+esc(m.label)+'<br><span class=small>Lobe '+esc(cpuL)+'/'+esc(memL)+' · Dev '+esc(cpuD)+'/'+esc(memD)+'</span></button>';
+const cpuP=c.paradedb?c.paradedb.cpu:'-',memP=c.paradedb?c.paradedb.mem:'-';
+return '<button class="mode-btn" data-active="'+(d.activeMode===k?1:0)+'" data-mode="'+esc(k)+'" onclick="switchMode(this.dataset.mode)" title="'+esc(m.desc)+'">'+esc(m.label)+'<br><span class=small>Lobe '+esc(cpuL)+'/'+esc(memL)+' · Dev '+esc(cpuD)+'/'+esc(memD)+' · DB '+esc(cpuP)+'/'+esc(memP)+'</span></button>';
 }).join('');
 el.innerHTML=btns+'<div id="modeMsg" class=small></div>';
 renderModeEdit(d.modes);
@@ -659,10 +662,11 @@ function renderModeEdit(modes){
 const el=document.getElementById('modeEdit');if(!el)return;
 const keys=Object.keys(modes);
 const field=(k,t,f)=>{const c=modes[k].configs[t]||{};return '<input data-me="'+k+'-'+t+'-'+f+'" type="text" value="'+esc(c[f]||'')+'" style="width:76px" title="'+esc(k+'/'+t+'/'+f)+'">';};
-el.innerHTML='<div class="small" style="margin-bottom:6px">调整各模式 LobeHub / Devbox 的 CPU 与内存（requests=limits）。保存后点击对应模式按钮即生效；若面板重启丢失，请用环境变量 MODE_DAILY_LOBE_CPU 等设置默认值。</div>'+
+el.innerHTML='<div class="small" style="margin-bottom:6px">调整各模式 LobeHub / Devbox / ParadeDB 的 CPU 与内存（requests=limits）。保存后点击对应模式按钮即生效；若面板重启丢失，请用环境变量 MODE_DAILY_LOBE_CPU 等设置默认值。</div>'+
 keys.map(k=>{const m=modes[k];return '<div class="row"><span><b>'+esc(m.label)+'</b> <span class=small>'+esc(m.desc)+'</span></span>'+
 '<span class="small mono">Lobe CPU '+field(k,'lobehub','cpu')+' MEM '+field(k,'lobehub','mem')+'</span>'+
-'<span class="small mono">Dev CPU '+field(k,'devbox','cpu')+' MEM '+field(k,'devbox','mem')+'</span></div>';}).join('')+
+'<span class="small mono">Dev CPU '+field(k,'devbox','cpu')+' MEM '+field(k,'devbox','mem')+'</span>'+
+'<span class="small mono">DB CPU '+field(k,'paradedb','cpu')+' MEM '+field(k,'paradedb','mem')+'</span></div>';}).join('')+
 '<div style="margin-top:8px"><button class="mode-btn" onclick="saveModes()">💾 保存模式配置</button> <button class="mode-btn" onclick="resetModes()">↩️ 恢复默认</button></div>'+
 '<div id="modeEditMsg" class="small" style="margin-top:6px"></div>';
 }
@@ -696,7 +700,7 @@ else{m.style.color='#f85149';m.textContent='❌ '+esc(d.error||'恢复失败');}
 }
 async function switchMode(k){
 const m=document.getElementById('modeMsg');if(!m)return;
-if(!confirm('切换到该模式将调整 LobeHub 与 Devbox 的 CPU/内存配额，确认？'))return;
+if(!confirm('切换到该模式将调整 LobeHub / Devbox / ParadeDB 的 CPU 内存配额（数据库可能触发滚动重启），确认？'))return;
 m.style.color='#d29922';m.textContent='⏳ 切换中...';
 const d=await j('/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:k})});
 if(!d)return;
@@ -860,7 +864,7 @@ app.post('/modes', requireAuth, requireTotp, async (req, res) => {
       const m = modes[k];
       if (!m) return res.status(400).json({ error: '模式 ' + k + ' 缺失，请提供完整三套模式' });
       const cfg = {};
-      for (const tkey of ['lobehub', 'devbox']) {
+      for (const tkey of ['lobehub', 'devbox', 'paradedb']) {
         const c = m.configs && m.configs[tkey];
         if (!c || !String(c.cpu || '').trim() || !String(c.mem || '').trim()) {
           return res.status(400).json({ error: '模式 ' + k + ' 的 ' + tkey + ' CPU/内存 不能为空' });

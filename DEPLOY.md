@@ -101,7 +101,8 @@ GITHUB_CALLBACK_URL = https://<面板域名>/auth/callback
 
 ### 🎛 模式切换
 - 页面"模式切换"卡片可一键切换三套配置（日常/并发Pro/开发Max）
-- 每套配置调整 LobeHub + Devbox 的 CPU/内存（requests=limits）
+- 每套配置调整 LobeHub + Devbox + ParadeDB 的 CPU/内存（requests=limits）
+- ⚠️ ParadeDB 为数据库：切换会 patch 其 resources 并可能触发 StatefulSet 滚动重启；三套模式默认对 ParadeDB 保持一致（500m/1Gi），如需差异请页面"编辑模式数值"或环境变量 MODE_*_PARADEDB_* 调整，并评估数据库影响
 - 切换前自动存档当前值，失败自动回滚，切换后轮询验证生效
 - 三套模式的数值可在代码 DEFAULT_MODES 中调整，或通过页面 POST /modes 接口（当前页面未暴露编辑框，默认取代码值）
 
