@@ -304,11 +304,19 @@ async function switchMode(modeKey) {
   const errors = [];
   const applied = {};
   try {
-    // 2. 依次应用
+    // 2. 依次应用（与当前值一致则跳过 patch，避免无谓滚动重启）
     for (const key of ['lobehub', 'devbox', 'paradedb']) {
       const t = targetFor(key);
       const c = cfg[key];
-      await kubePatchResources(t.kind, t.name, buildResources(c.mem, c.cpu));
+      const target = buildResources(c.mem, c.cpu);
+      const cur = saved[key];
+      const same = cur && cur.requests && cur.limits &&
+        cur.requests.cpu === target.requests.cpu &&
+        cur.requests.memory === target.requests.memory &&
+        cur.limits.cpu === target.limits.cpu &&
+        cur.limits.memory === target.limits.memory;
+      if (same) { applied[key] = true; continue; }
+      await kubePatchResources(t.kind, t.name, target);
       applied[key] = true;
     }
   } catch (e) {
