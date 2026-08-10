@@ -120,6 +120,21 @@ GITHUB_CALLBACK_URL = https://<面板域名>/auth/callback
 - BACKUP_NAMESPACE: 备份 CronJob 所在命名空间（默认同 KUBE_NAMESPACE）
 - TZ: 容器时区需设为 Asia/Shanghai 以保证备份调度按北京时间（Sealos 环境变量填 TZ=Asia/Shanghai）
 
+### 🛠 模式数值环境变量（v2.1 新增，可选）
+三个模式的具体数值可用环境变量覆盖默认值，格式：`MODE_<KEY>_<TARGET>_<FIELD>`
+- KEY: DAILY / PRO / DEVELOP
+- TARGET: LOBEHUB / DEVBOX
+- FIELD: CPU / MEM
+- 示例：`MODE_DEVELOP_DEVBOX_MEM=3Gi`、`MODE_DAILY_LOBE_CPU=300m`
+- 优先级：页面保存的配置(state.json) > 环境变量(默认值) > 内置默认值
+- 页面"⚙️ 编辑模式数值"可直接改三套数值并保存；"↩️ 恢复默认"回到环境变量/内置默认
+
+### 🕐 备份调度环境变量（v2.1 新增，可选）
+- BACKUP_TIMES: 逗号分隔的执行时间（北京时间），如 `02:30,04:30`
+- BACKUP_ENABLED: true/false，是否启用定时备份
+- 仅在 state.json 缺失/重置时作为默认值；页面保存后以页面为准
+- ⚠️ state.json 默认存 `/data/state.json`，若 Sealos 未给面板挂持久卷，容器重启会丢页面配置（环境变量仍兜底默认值）
+
 ### ⚠️ RBAC 需更新
 新增模式切换/资源/备份功能需要重新应用新的 rbac.yaml（主资源 patch + PVC 读取 + batch Job 权限）。
 务必先 `kubectl apply -f rbac.yaml` 再部署新代码。
