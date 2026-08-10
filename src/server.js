@@ -593,14 +593,19 @@ app.get('/', (req, res) => {
     if (TOTP_SECRET && !req.session.totpVerified) return res.redirect('/totp/verify');
   }
   res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Lobe 开关控制面板</title>
-<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;background:#0f1115;color:#e6e8eb}h1{font-size:22px}button{font-size:15px;padding:10px 16px;border:none;border-radius:8px;cursor:pointer;margin:6px 6px 6px 0}.pause{background:#d64545;color:#fff}.resume{background:#2ea043;color:#fff}.logout{background:#333;color:#ccc}.card{background:#1c2128;padding:16px;border-radius:10px;margin:12px 0}.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2a2f38;gap:8px}.running{color:#3fb950}.paused{color:#f85149}.err{color:#d29922}.ok{color:#3fb950}.mode-btn{background:#21262d;border:1px solid #30363d;color:#e6e8eb}.mode-btn[data-active="1"]{background:#1f6feb;border-color:#1f6feb;color:#fff}select,input[type=text],input[type=number]{background:#0d1117;border:1px solid #30363d;color:#e6e8eb;padding:6px;border-radius:6px;margin:2px}h2{font-size:17px;margin:16px 0 8px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.mono{font-family:monospace}.small{font-size:13px;color:#8b949e}.tag{display:inline-block;background:#161b22;border:1px solid #30363d;padding:2px 8px;border-radius:20px;font-size:12px;margin:2px}</style></head>
-<body><h1>🔌 Lobe 一键开关</h1>
+<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;background:#0f1115;color:#e6e8eb}h1{font-size:22px;margin:0}button{font-size:15px;padding:10px 16px;border:none;border-radius:8px;cursor:pointer;margin:6px 6px 6px 0}.pause{background:#d64545;color:#fff}.resume{background:#2ea043;color:#fff}.logout{background:#333;color:#ccc}.card{background:#1c2128;padding:16px;border-radius:10px;margin:12px 0}.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2a2f38;gap:8px}.running{color:#3fb950}.paused{color:#f85149}.err{color:#d29922}.ok{color:#3fb950}.mode-btn{background:#21262d;border:1px solid #30363d;color:#e6e8eb}.mode-btn[data-active="1"]{background:#1f6feb;border-color:#1f6feb;color:#fff}select,input[type=text],input[type=number]{background:#0d1117;border:1px solid #30363d;color:#e6e8eb;padding:6px;border-radius:6px;margin:2px}h2{font-size:17px;margin:16px 0 8px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.mono{font-family:monospace}.small{font-size:13px;color:#8b949e}.tag{display:inline-block;background:#161b22;border:1px solid #30363d;padding:2px 8px;border-radius:20px;font-size:12px;margin:2px}.head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap}</style></head>
+<body><div class="head"><h1>🔌 Lobe 一键开关</h1><button class="logout" onclick="window.location='/logout'">退出登录</button></div>
 <p>已验证：<b>${escapeHtml(AUTH_MODE === 'totp' ? '动态码' : (req.session.user ? req.session.user.login : ''))}</b></p>
 <div id="msg" style="margin:8px 0;font-weight:bold"></div>
 
 <div class="card">
-<h2>📊 资源状态</h2>
+<h2>🚦 资源与应用</h2>
 <div id="res"></div>
+<div id="list" style="margin-top:10px"></div>
+<div>
+<button class="pause" onclick="act('pause')">⏸ 一键暂停</button>
+<button class="resume" onclick="act('resume')">▶ 一键恢复</button>
+</div>
 </div>
 
 <div class="card">
@@ -612,20 +617,9 @@ app.get('/', (req, res) => {
 </div>
 
 <div class="card">
-<h2>🚦 应用控制</h2>
-<div id="list"></div>
-<div>
-<button class="pause" onclick="act('pause')">⏸ 一键暂停</button>
-<button class="resume" onclick="act('resume')">▶ 一键恢复</button>
-</div>
-</div>
-
-<div class="card">
 <h2>💾 数据库备份</h2>
 <div id="bk"></div>
 </div>
-
-<div><button class="logout" onclick="window.location='/logout'">退出登录</button></div>
 <script>
 const LOGIN_URL='${AUTH_MODE === 'totp' ? '/totp/verify' : '/auth/login'}';
 async function j(url,opts){const r=await fetch(url,opts);if(r.status===401){window.location=LOGIN_URL;return null;}return r.json();}
@@ -661,7 +655,7 @@ MODE_META[k]={label:m.label,desc:m.desc};
 const cpuL=c.lobehub?c.lobehub.cpu:'-',memL=c.lobehub?c.lobehub.mem:'-';
 const cpuD=c.devbox?c.devbox.cpu:'-',memD=c.devbox?c.devbox.mem:'-';
 const cpuP=c.paradedb?c.paradedb.cpu:'-',memP=c.paradedb?c.paradedb.mem:'-';
-return '<button class="mode-btn" data-active="'+(d.activeMode===k?1:0)+'" data-mode="'+esc(k)+'" onclick="switchMode(this.dataset.mode)" title="'+esc(m.desc)+'">'+esc(m.label)+'<br><span class=small>Lobe '+esc(cpuL)+'/'+esc(memL)+' · Dev '+esc(cpuD)+'/'+esc(memD)+' · DB '+esc(cpuP)+'/'+esc(memP)+'</span></button>';
+return '<button class="mode-btn" data-active="'+(d.activeMode===k?1:0)+'" data-mode="'+esc(k)+'" onclick="switchMode(this.dataset.mode)" title="'+esc(m.desc)+'">'+esc(m.label)+'<br><span class=small>Lobe '+esc(cpuL)+'/'+esc(memL)+'</span><br><span class=small>Dev '+esc(cpuD)+'/'+esc(memD)+'</span><br><span class=small>DB '+esc(cpuP)+'/'+esc(memP)+'</span></button>';
 }).join('');
 el.innerHTML=btns+'<div id="modeMsg" class=small></div>';
 renderModeEdit(d.modes);
@@ -749,9 +743,13 @@ const d=await j('/backup/jobs');if(!d||!d.jobs)return;const el=document.getEleme
 if(!el)return;
 const rows=d.jobs.map(x=>{
 const st=x.state==='success'?'<span class=ok>成功</span>':(x.state==='failed'?'<span class=err>失败</span>':'<span class=small>进行中</span>');
-return '<div class=row><span class=small>'+esc((x.name||'').slice(0,30))+'</span><span class=small>'+esc((x.created||'').slice(0,16).replace('T',' '))+'</span>'+st+'</div>';
+return '<div class=row><span class=small>'+esc((x.name||'').slice(0,30))+'</span><span class=small>'+fmtTime(x.created)+'</span>'+st+'</div>';
 }).join('');
-el.innerHTML='<div class=small style="margin-top:6px">最近备份：</div>'+rows;
+el.innerHTML='<div class=small style="margin-top:6px">最近备份（北京时间）：</div>'+rows;
+}
+// 将 UTC ISO 时间转北京时间显示（如 2026-08-10 15:30）
+function fmtTime(iso){
+try{const d=new Date(iso);if(isNaN(d.getTime()))return iso||'';const b=new Date(d.getTime()+8*3600*1000);return b.toISOString().slice(0,16).replace('T',' ');}catch(e){return iso||'';}
 }
 async function act(kind){const btn=document.querySelectorAll('button');btn.forEach(b=>b.disabled=true);
 const msg=document.getElementById('msg');
