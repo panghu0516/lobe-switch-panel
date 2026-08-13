@@ -34,7 +34,8 @@ RUN chmod +x /entrypoint.sh
 # 状态文件持久化目录（挂载 PVC）
 RUN mkdir -p /data
 
-EXPOSE 3000
+# 3000 = 主面板；8080 = auth-proxy 门卫（Cookie 登录 + 反代，公网直连入口）
+EXPOSE 3000 8080
 
 ENV NODE_ENV=production
 CMD ["/entrypoint.sh"]
