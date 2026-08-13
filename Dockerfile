@@ -3,26 +3,19 @@ FROM node:20-alpine
 WORKDIR /app
 
 # ── cloudflared 隧道客户端（固定版本 2026.7.3，可复现；alpine 静态二进制直接可跑）──
-# 下载源：GitHub 直连 → ghproxy 镜像 → gh-proxy.com 镜像（ACR 国内构建环境 GitHub 可能超时）
+# 构建机为海外环境，GitHub 官方直连即可；timeout 300 设总时长上限，防止网络抖动把构建拖卡
 RUN set -eux; \
     mkdir -p /usr/local/bin; \
-    for url in \
-      "https://github.com/cloudflare/cloudflared/releases/download/2026.7.3/cloudflared-linux-amd64" \
-      "https://ghfast.top/https://github.com/cloudflare/cloudflared/releases/download/2026.7.3/cloudflared-linux-amd64" \
-      "https://gh-proxy.com/https://github.com/cloudflare/cloudflared/releases/download/2026.7.3/cloudflared-linux-amd64" \
-    ; do \
-      echo ">> try: $url"; \
-      if wget -q --timeout=60 -O /usr/local/bin/cloudflared "$url"; then \
-        chmod +x /usr/local/bin/cloudflared; \
-        if cloudflared --version >/dev/null 2>&1; then echo "OK: cloudflared downloaded"; break; fi; \
-      fi; \
-      rm -f /usr/local/bin/cloudflared; \
-    done; \
-    test -x /usr/local/bin/cloudflared
+    timeout 300 wget -q --timeout=60 -O /usr/local/bin/cloudflared \
+      "https://github.com/cloudflare/cloudflared/releases/download/2026.7.3/cloudflared-linux-amd64"; \
+    chmod +x /usr/local/bin/cloudflared; \
+    cloudflared --version >/dev/null 2>&1; \
+    echo "OK: cloudflared downloaded"
 
 # 先拷贝依赖清单，最大化层缓存
 COPY package.json ./
-RUN npm install --omit=dev --registry=https://registry.npmmirror.com
+# 海外构建机直接用官方 registry，避免国内镜像在海外绕路
+RUN npm install --omit=dev --registry=https://registry.npmjs.org
 
 # 再拷贝源码
 COPY src ./src
