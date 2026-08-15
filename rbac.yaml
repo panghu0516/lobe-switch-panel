@@ -4,6 +4,7 @@
 # 说明:
 #   - scale 子资源: 暂停/恢复 (get/patch)
 #   - 主资源 statefulsets/deployments: 读配置 + patch resources (模式切换)
+#   - 面板自身 lobe-switch-panel: 仅主资源 patch（单独重新部署），无 scale 权限
 #   - persistentvolumeclaims: 读 PVC 容量/用量 (资源展示)
 #   - cronjobs/jobs (batch): 数据库备份管理 (创建/触发/查状态)
 #   - 读不到 Secret/ConfigMap，删不了任何资源
@@ -50,6 +51,7 @@ rules:
   - lobehub-paradedb
   - my-devbox
   - device-gateway
+  - lobe-switch-panel # 面板自身（excludeBulk：不参与一键暂停/恢复，仅单独重新部署）
 # 3. PVC 读取（资源展示）——Sealos 会给 PVC 加 vn- 前缀，故不锁 resourceNames，仅 namespace 内只读
 - apiGroups:
   - ""
