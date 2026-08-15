@@ -25,7 +25,9 @@ const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'https://dashscope.aliyuncs.
 const EMBEDDING_BATCH_LIMIT = parseInt(process.env.EMBEDDING_BATCH_LIMIT || '20', 10); // Dashscope 单请求上限
 const EMBEDDING_RETRIES = parseInt(process.env.EMBEDDING_RETRIES || '2', 10);
 const EMBEDDING_RETRY_DELAY_MS = parseInt(process.env.EMBEDDING_RETRY_DELAY_MS || '300', 10);
-const PROXY_TOKEN = process.env.EMBEDDING_PROXY_TOKEN || ''; // 可选：第二道门
+// # 号在 Sealos env 中保存会被截断（连 \# 也会被截），token 用 URL 编码 %23 表示字面 #
+const unescapeEnvVal = (v) => (!v ? v : String(v).replace(/%2523|%23/g, m => (m === '%2523' ? '%23' : '#')));
+const PROXY_TOKEN = unescapeEnvVal(process.env.EMBEDDING_PROXY_TOKEN) || ''; // 可选：第二道门
 const MODEL_MAP = { 'text-embedding-3-small': 'qwen3.7-text-embedding' }; // 与服务商配置一致
 
 const router = express.Router();

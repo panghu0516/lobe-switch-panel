@@ -10,17 +10,57 @@ const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
 const cron = require('node-cron');
 
+/* TOTP 暴力破解防护：失败计数 + 按 IP 锁定 + 指数退避 */
+const TOTP_MAX_FAILURES = 5;            // 连续失败次数上限
+const TOTP_LOCK_BASE_MS = 5 * 60 * 1000; // 首次锁定 5 分钟
+const totpFailures = new Map();          // key: ip -> { count, lockedUntil, lockCount }
+function totpLockInfo(ip) {
+  const now = Date.now();
+  const info = totpFailures.get(ip);
+  if (!info) return { failed: 0, locked: false, retryAfterSec: 0 };
+  // 锁定到期后自动清零计数（重新开始）
+  if (info.lockedUntil && now >= info.lockedUntil) {
+    totpFailures.delete(ip);
+    return { failed: 0, locked: false, retryAfterSec: 0 };
+  }
+  return {
+    failed: info.count,
+    locked: !!info.lockedUntil,
+    retryAfterSec: info.lockedUntil ? Math.ceil((info.lockedUntil - now) / 1000) : 0,
+    lockCount: info.lockCount || 0,
+  };
+}
+function totpRecordFailure(ip) {
+  const now = Date.now();
+  let info = totpFailures.get(ip) || { count: 0, lockedUntil: 0, lockCount: 0 };
+  // 若已锁定且未到期，直接返回（不再累加）
+  if (info.lockedUntil && now < info.lockedUntil) return;
+  info.count += 1;
+  if (info.count >= TOTP_MAX_FAILURES) {
+    // 指数退避：第 n 次锁定 = base * 2^(n-1)，上限 2 小时
+    info.lockCount += 1;
+    const multiplier = Math.min(Math.pow(2, info.lockCount - 1), 24); // 5min,10min,20min,...~2h
+    info.lockedUntil = now + Math.min(TOTP_LOCK_BASE_MS * multiplier, 2 * 60 * 60 * 1000);
+    info.count = 0;
+  }
+  totpFailures.set(ip, info);
+}
+function totpRecordSuccess(ip) { totpFailures.delete(ip); }
+function clientIp(req) {
+  return (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
+}
+
 /* ================= 配置 ================= */
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID || '';
-const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET || '';
+const GITHUB_CLIENT_SECRET = unescapeEnvVal(process.env.GITHUB_CLIENT_SECRET) || '';
 const GITHUB_CALLBACK_URL = process.env.GITHUB_CALLBACK_URL || '';
 const ALLOWED_GITHUB_LOGIN = (process.env.ALLOWED_GITHUB_LOGIN || '').split(',').map(s => s.trim()).filter(Boolean);
-const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
-const TOTP_SECRET = process.env.TOTP_SECRET || '';
+const SESSION_SECRET = unescapeEnvVal(process.env.SESSION_SECRET) || crypto.randomBytes(32).toString('hex');
+const TOTP_SECRET = unescapeEnvVal(process.env.TOTP_SECRET) || '';
 const AUTH_MODE = process.env.AUTH_MODE || 'both';
 const KUBE_API_SERVER = (process.env.KUBE_API_SERVER || '').replace(/\/+$/, '');
-const KUBE_SA_TOKEN = process.env.KUBE_SA_TOKEN || '';
+const KUBE_SA_TOKEN = unescapeEnvVal(process.env.KUBE_SA_TOKEN) || '';
 const KUBE_NAMESPACE = process.env.KUBE_NAMESPACE || 'default';
 const APPS_CONFIG = parseApps(process.env.APPS_CONFIG || '[]');
 const STATE_FILE = process.env.STATE_FILE || '/data/state.json';
@@ -31,15 +71,26 @@ const BACKUP_ENABLED_ENV = process.env.BACKUP_ENABLED;
 const BACKUP_TIMES_ENV = (process.env.BACKUP_TIMES || '').split(',').map(s => s.trim()).filter(Boolean);
 // 面板自备备份配置（优先）：配了就不再依赖 CronJob 动态读取
 const BACKUP_IMAGE = process.env.BACKUP_IMAGE || '';
-const BACKUP_PULL_SECRET = process.env.BACKUP_PULL_SECRET || '';
+const BACKUP_PULL_SECRET = unescapeEnvVal(process.env.BACKUP_PULL_SECRET) || '';
+// # 号实测在 Sealos env 中保存会被截断（连 \# 也会被截）。
+// 约定：填写侧用 URL 编码 %23 表示字面 #（完全不含 # 字符），运行时统一还原。
+//   示例：密码 p@ss#word -> 填 p@ss%23word；若值本身要字面 %23 -> 填 %2523。
+//   覆盖顺序：%2523 -> %23  =>  %23 -> #
+function unescapeEnvVal(v) {
+  if (!v) return v;
+  return String(v)
+    .replace(/%2523|%23/g, m => (m === '%2523' ? '%23' : '#'));
+}
+
 // 面板自备备份环境变量（在 Sealos 环境变量里逐条配置，与 CronJob 同款命名）
+// 注意：值统一过 unescapeEnvVal，因此含 # 的密钥请用 \# 填写
 const PANEL_BACKUP_ENV = [
   ['PG_URI', process.env.PG_URI],
   ['S3_URI', process.env.S3_URI],
   ['S3_BUCK', process.env.S3_BUCK],
   ['S3_NAME', process.env.S3_NAME],
   ['TZ', process.env.TZ || 'Asia/Shanghai']
-].filter(([k, v]) => v).map(([name, value]) => ({ name, value }));
+].filter(([k, v]) => v).map(([name, value]) => ({ name, value: unescapeEnvVal(value) }));
 
 // 模式切换针对的三个维度应用（lobe 主服务 + devbox + paradedb 数据库）
 const MODE_TARGETS = [
@@ -55,9 +106,10 @@ const MODE_TARGETS = [
 function defaultModesFromEnv() {
   const defaults = {
     // 注：paradedb 为数据库，建议三套模式保持一致或接近实际配置，避免切换触发滚动重启
-    daily: { label: '日常', desc: '轻量日常运维', configs: { lobehub: { cpu: '200m', mem: '2Gi' }, devbox: { cpu: '200m', mem: '0.5Gi' }, paradedb: { cpu: '500m', mem: '1Gi' } } },
-    pro:   { label: '并发 Pro', desc: '高并发运行', configs: { lobehub: { cpu: '500m', mem: '2Gi' }, devbox: { cpu: '500m', mem: '1Gi' }, paradedb: { cpu: '500m', mem: '1Gi' } } },
-    develop: { label: '开发 Max', desc: '开发编译模式', configs: { lobehub: { cpu: '1', mem: '2Gi' }, devbox: { cpu: '1', mem: '2Gi' }, paradedb: { cpu: '500m', mem: '1Gi' } } }
+    // 注：内存统一用 Mi 单位（1Gi = 1024Mi），避免 Gi/Mi 混用产生困惑；CPU 单位 m/核不变
+    daily: { label: '日常', desc: '轻量日常运维', configs: { lobehub: { cpu: '200m', mem: '2048Mi' }, devbox: { cpu: '200m', mem: '512Mi' }, paradedb: { cpu: '500m', mem: '1024Mi' } } },
+    pro:   { label: '并发 Pro', desc: '高并发运行', configs: { lobehub: { cpu: '500m', mem: '2048Mi' }, devbox: { cpu: '500m', mem: '1024Mi' }, paradedb: { cpu: '500m', mem: '1024Mi' } } },
+    develop: { label: '开发 Max', desc: '开发编译模式', configs: { lobehub: { cpu: '1000m', mem: '2048Mi' }, devbox: { cpu: '1000m', mem: '2048Mi' }, paradedb: { cpu: '500m', mem: '1024Mi' } } }
   };
   const out = JSON.parse(JSON.stringify(defaults));
   for (const k of Object.keys(out)) {
@@ -188,6 +240,36 @@ async function kubeScale(kind, name, replicas) {
   return res.json();
 }
 
+// 重新部署（kubectl rollout restart 等价）
+// 通过给 Pod template 打 restartedAt annotation 触发滚动更新；配合 imagePullPolicy=Always，
+// 同一镜像地址也能重新拉取最新内容（等效 Sealos 后台"重新部署"）。
+async function kubeRolloutRestart(kind, name) {
+  // merge-patch 只加/改这一个 annotation key，不覆盖其它 annotations
+  const patch = {
+    spec: {
+      template: {
+        metadata: {
+          annotations: { 'kubectl.kubernetes.io/restartedAt': new Date().toISOString() }
+        }
+      }
+    }
+  };
+  const url = kubeUrl(kind, name);
+  const res = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${KUBE_SA_TOKEN}`,
+      'Content-Type': 'application/merge-patch+json',
+      Accept: 'application/json'
+    },
+    body: JSON.stringify(patch),
+    agent: kubeAgent,
+    timeout: 15000
+  });
+  if (!res.ok) throw new Error(`重新部署 ${kind}/${name}: ${res.status} ${await safeBody(res)}`);
+  return res.json();
+}
+
 // 读取应用完整 spec（用于模式切换前的存档 + 资源展示）
 async function kubeGetFull(kind, name) {
   const data = await kubeRequest('GET', kubeUrl(kind, name));
@@ -265,9 +347,9 @@ async function getStatuses() {
   for (const app of APPS_CONFIG) {
     try {
       const st = await kubeGet(app.kind, app.name);
-      list.push({ name: app.name, kind: app.kind, replicas: st.ready != null ? st.ready : st.desired, running: st.ready > 0 });
+      list.push({ name: app.name, kind: app.kind, replicas: st.ready != null ? st.ready : st.desired, running: st.ready > 0, excludeBulk: !!app.excludeBulk, kindAttr: app.kind });
     } catch (e) {
-      list.push({ name: app.name, kind: app.kind, replicas: null, running: null, error: e.message });
+      list.push({ name: app.name, kind: app.kind, replicas: null, running: null, error: e.message, excludeBulk: !!app.excludeBulk, kindAttr: app.kind });
     }
   }
   return list;
@@ -573,16 +655,32 @@ app.get('/totp/setup', async (req, res) => {
 });
 
 app.get('/totp/verify', (req, res) => {
-  res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>动态码验证</title><style>body{font-family:system-ui;background:#0f1115;color:#e6e8eb;padding:40px;max-width:360px;margin:auto}input{font-size:20px;padding:10px;width:100%;margin:8px 0;border-radius:6px;border:1px solid #333;background:#1c2128;color:#e6e8eb}button{font-size:16px;padding:12px;width:100%;border:none;border-radius:8px;background:#2ea043;color:#fff;cursor:pointer}label{display:block;margin-top:12px}</style></head><body><h2>🔐 输入动态码</h2><form method="post" action="/totp/verify"><label>6 位动态码</label><input type="text" name="token" maxlength="6" autocomplete="one-time-code" required><button type="submit">验证</button></form><p id="msg" style="color:#f85149"></p><script>const q=new URLSearchParams(location.search);if(q.get('e'))document.getElementById('msg').textContent='动态码错误，请重试';</script></body></html>`);
+  const lock = totpLockInfo(clientIp(req));
+  const lockHtml = lock.locked
+    ? `<p style="color:#f85149;font-weight:bold">🔒 尝试次数过多，已锁定 <b>${lock.retryAfterSec}</b> 秒，请稍后再试</p>`
+    : (lock.failed > 0 ? `<p style="color:#d29922">连续失败 ${lock.failed} 次，还剩 <b>${TOTP_MAX_FAILURES - lock.failed}</b> 次机会</p>` : '');
+  res.status(200).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>动态码验证</title><style>body{font-family:system-ui;background:#0f1115;color:#e6e8eb;padding:40px;max-width:360px;margin:auto}input{font-size:20px;padding:10px;width:100%;margin:8px 0;border-radius:6px;border:1px solid #333;background:#1c2128;color:#e6e8eb}button{font-size:16px;padding:12px;width:100%;border:none;border-radius:8px;background:#2ea043;color:#fff;cursor:pointer}button:disabled{background:#444;cursor:not-allowed}label{display:block;margin-top:12px}</style></head><body><h2>🔐 输入动态码</h2>${lockHtml}<form method="post" action="/totp/verify"><label>6 位动态码</label><input type="text" name="token" maxlength="6" autocomplete="one-time-code" required${lock.locked?' disabled':''}><button type="submit"${lock.locked?' disabled':''}>验证</button></form><p id="msg" style="color:#f85149"></p><script>const q=new URLSearchParams(location.search);if(q.get('e'))document.getElementById('msg').textContent='动态码错误，请重试';</script></body></html>`);
 });
 
 app.post('/totp/verify', (req, res) => {
+  const ip = clientIp(req);
+  const lock = totpLockInfo(ip);
+  if (lock.locked) {
+    return res.status(429).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>锁定</title></head><body style="font-family:system-ui;background:#0f1115;color:#e6e8eb;padding:40px"><h2 style="color:#f85149">🔒 尝试次数过多</h2><p>请 <b>${lock.retryAfterSec}</b> 秒后再试。</p></body></html>`);
+  }
   const token = String(req.body.token || '').trim();
-  const ok = speakeasy.totp.verify({ secret: TOTP_SECRET, encoding: 'base32', token, window: 1 });
+  const ok = speakeasy.totp.verify({
+    secret: TOTP_SECRET,
+    encoding: 'base32',
+    token,
+    window: 1, // RFC 6238 标准：允许 ±1 个时间步（当前码前后各 30 秒），容错时间漂移
+  });
   if (ok) {
+    totpRecordSuccess(ip);
     req.session.totpVerified = true;
     return res.redirect('/');
   }
+  totpRecordFailure(ip);
   res.redirect('/totp/verify?e=1');
 });
 
@@ -632,10 +730,28 @@ async function load(){await loadStatus();await loadResources();await loadModes()
 async function loadStatus(){
 const s=await j('/status');if(!s)return;const list=document.getElementById('list');
 const apps=(s&&s.apps)||[];const anyErr=apps.length===0;
-list.innerHTML='<div class=row><b>应用</b><b>副本</b><b>状态</b></div>'+apps.map(x=>{
+list.innerHTML='<div class=row><b>应用</b><b>副本</b><b>状态</b><b>操作</b></div>'+apps.map(x=>{
 const st=x.running===true?'<span class=running>运行中</span>':(x.running===false?'<span class=paused>已暂停</span>':'<span class=err>'+esc(x.error||'查询失败')+'</span>');
-return '<div class=row><span>'+esc(x.name)+' ('+x.kind+')</span><span>'+x.replicas+'</span><span>'+st+'</span></div>';}).join('')+'</div>';
+const bulkTag=x.excludeBulk?' <span class=tag style="color:#d29922" title="不参与一键暂停/恢复">仅重启</span>':'';
+const btn='<button class="mode-btn small" style="padding:2px 10px" onclick="redeployApp(\''+esc(x.name)+'\')">🔄 重新部署</button>';
+return '<div class=row><span>'+esc(x.name)+' ('+x.kind+')'+bulkTag+'</span><span>'+x.replicas+'</span><span>'+st+'</span><span>'+btn+'</span></div>';}).join('')+'</div>';
 if(anyErr){const m=document.getElementById('msg');m.style.color='#d29922';m.textContent='⚠️ 未获取到应用列表，请检查 KUBE_SA_TOKEN / KUBE_API_SERVER 配置';}
+}
+async function redeployApp(name){
+if(!confirm('确认重新部署 '+name+'？将触发滚动更新（重启容器，imagePullPolicy=Always 时重新拉取最新镜像）。'))return;
+const m=document.getElementById('msg');
+m.style.color='#d29922';m.textContent='⏳ 正在重新部署 '+name+' ...';
+const d=await j('/app/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})});
+if(!d)return;
+if(d.ok){m.style.color='#3fb950';m.textContent='✅ '+name+' 重新部署已触发：'+esc(d.note||'');pollStatus();}
+else{m.style.color='#f85149';m.textContent='❌ '+esc(d.error||'触发失败');}
+}
+// 操作后轮询：每 2 秒刷新状态，共 4 次（8 秒窗口，覆盖滚动更新过程）
+async function pollStatus(times=4,interval=2000){
+for(let i=0;i<times;i++){
+await new Promise(r=>setTimeout(r,interval));
+await loadStatus();
+}
 }
 async function loadResources(){
 const d=await j('/resources');if(!d)return;const el=document.getElementById('res');
@@ -760,7 +876,7 @@ if(kind==='pause' && !confirm('确认暂停全部服务？正在进行的会话�
 try{const r=await fetch('/'+kind,{method:'POST'});
 if(r.status===401){msg.style.color='#f85149';msg.textContent='⚠️ 登录已过期，正在跳转登录...';setTimeout(()=>window.location=LOGIN_URL,800);return;}
 const s=await r.json();
-if(s && s.ok){msg.style.color='#3fb950';msg.textContent=(kind==='pause'?'✅ 已全部暂停':'✅ 已全部恢复');await load();}
+if(s && s.ok){msg.style.color='#3fb950';msg.textContent=(kind==='pause'?'✅ 已全部暂停':'✅ 已全部恢复');await load();pollStatus();}
 else if(s&&s.errors&&s.errors.length){msg.style.color='#f85149';msg.textContent='部分失败: '+esc(s.errors.join(' | '));}
 else{msg.style.color='#f85149';msg.textContent='操作失败: '+esc((s&&s.error)||'HTTP '+r.status);}}
 catch(e){msg.style.color='#f85149';msg.textContent='请求错误: '+esc(e.message);}
@@ -978,6 +1094,8 @@ app.post('/pause', requireAuth, requireTotp, async (req, res) => {
   const saved = {};
   const errors = [];
   for (const app of APPS_CONFIG) {
+    // excludeBulk=true 的应用不参与一键暂停/恢复（如面板自身，避免把自己停掉）
+    if (app.excludeBulk) continue;
     try {
       const st = await kubeGet(app.kind, app.name);
       const cur = st.desired != null ? st.desired : 1;
@@ -994,10 +1112,25 @@ app.post('/pause', requireAuth, requireTotp, async (req, res) => {
   res.json({ ok: true, savedReplicas: saved });
 });
 
+app.post('/app/restart', requireAuth, requireTotp, async (req, res) => {
+  const { name } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name 参数缺失' });
+  const app = APPS_CONFIG.find(a => a.name === name);
+  if (!app) return res.status(404).json({ error: `应用 ${name} 不在 APPS_CONFIG 中` });
+  // switch-panel 自身也允许（excludeBulk 应用：不参与一键暂停/恢复，但可单独重新部署）
+  try {
+    await kubeRolloutRestart(app.kind || 'StatefulSet', app.name);
+    res.json({ ok: true, name: app.name, note: '正在滚动重新部署（imagePullPolicy=Always 时会重新拉取镜像）' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/resume', requireAuth, requireTotp, async (req, res) => {
   const state = readState();
   const errors = [];
   for (const app of APPS_CONFIG) {
+    if (app.excludeBulk) continue;
     const target = (state.savedReplicas && state.savedReplicas[app.name]) || app.lastReplicas || 1;
     try {
       await kubeScale(app.kind, app.name, target);

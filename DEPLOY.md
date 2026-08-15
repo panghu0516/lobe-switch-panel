@@ -161,3 +161,30 @@ GITHUB_CALLBACK_URL = https://<面板域名>/auth/callback
 ```bash
 node test-proxy.js   # mock 上游，验证 1/49/100 条拆批合并 + chat 透传 + 非法输入
 ```
+
+## 环境变量转义约定（# 号陷阱）
+
+**Sealos env 中值一旦含 `#` 字符就会被截断**（连 `\#` 也会被截）。因此所有变量填写侧 **100% 不允许出现裸 `#`**：
+
+| 想要的值 | Sealos 里填 | 运行时还原 |
+|---|---|---|
+| `p@ss#word` | `p@ss%23word` | `p@ss#word` |
+| `AK#KEY` | `AK%23KEY` | `AK#KEY` |
+| 值本身要字面 `%23` | `%2523` | `%23` |
+
+- 涉及变量：`PG_URI` / `S3_URI` / `S3_BUCK` / `S3_NAME` / `KUBE_SA_TOKEN` / `SESSION_SECRET` / `TOTP_SECRET` / `GITHUB_CLIENT_SECRET` / `BACKUP_PULL_SECRET` / `EMBEDDING_PROXY_TOKEN`
+- 实现：`src/server.js` 与 `src/embedding-proxy.js` 的 `unescapeEnvVal()`，单次正则替换不递归
+- 旧 `\#` 写法作废（还原函数已改为 `%23` 语义），重部署时请把已填的 `\#` 改成 `%23`
+
+## 日志持久化（/data/logs）
+
+容器内 `/data` 是挂载的 PVC，全部服务日志落盘于此，容器重启不丢；超过 20MB 自动轮转压缩为 `.old.gz`：
+
+| 服务 | 日志路径 |
+|---|---|
+| cloudflared 隧道 | `/data/logs/cloudflared.log` |
+| auth-proxy 门卫 | `/data/logs/auth-proxy.log` |
+| 主面板 server.js | `/data/logs/server.log`（同时保留容器 stdout） |
+
+可用 `LOG_DIR` 环境变量覆盖日志目录（默认 `/data/logs`）。
+
