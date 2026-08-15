@@ -733,7 +733,7 @@ const apps=(s&&s.apps)||[];const anyErr=apps.length===0;
 list.innerHTML='<div class=row><b>应用</b><b>副本</b><b>状态</b><b>操作</b></div>'+apps.map(x=>{
 const st=x.running===true?'<span class=running>运行中</span>':(x.running===false?'<span class=paused>已暂停</span>':'<span class=err>'+esc(x.error||'查询失败')+'</span>');
 const bulkTag=x.excludeBulk?' <span class=tag style="color:#d29922" title="不参与一键暂停/恢复">仅重启</span>':'';
-const btn='<button class="mode-btn small" style="padding:2px 10px" onclick="redeployApp(\''+esc(x.name)+'\')">🔄 重新部署</button>';
+const btn='<button class="mode-btn small" style="padding:2px 10px" data-name="'+esc(x.name)+'" onclick="redeployApp(this.dataset.name)">🔄 重新部署</button>';
 return '<div class=row><span>'+esc(x.name)+' ('+x.kind+')'+bulkTag+'</span><span>'+x.replicas+'</span><span>'+st+'</span><span>'+btn+'</span></div>';}).join('')+'</div>';
 if(anyErr){const m=document.getElementById('msg');m.style.color='#d29922';m.textContent='⚠️ 未获取到应用列表，请检查 KUBE_SA_TOKEN / KUBE_API_SERVER 配置';}
 }
