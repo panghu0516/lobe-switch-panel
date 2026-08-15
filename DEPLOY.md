@@ -139,3 +139,25 @@ GITHUB_CALLBACK_URL = https://<面板域名>/auth/callback
 ### ⚠️ RBAC 需更新
 新增模式切换/资源/备份功能需要重新应用新的 rbac.yaml（主资源 patch + PVC 读取 + batch Job 权限）。
 务必先 `kubectl apply -f rbac.yaml` 再部署新代码。
+
+## 新增功能说明（v3 · 模型服务商代理）
+
+### 🪄 是什么
+- 面板 3000 端口新增 `/v1/*` 路由：`/v1/embeddings`（embedding 拆批代理）+ `/v1/chat/completions`（透传）
+- 解决 LobeHub 知识库向量化时「单请求超 20 条 embedding 报 400」问题：自动把请求拆成 ≤20 条/批并发发给上游（DashScope 兼容格式），再按原序合并返回
+- 无需新增端口/环境变量，Sealos 部署配置不变；代码在 `src/embedding-proxy.js`
+
+### 🔌 LobeHub 侧配置
+1. 服务商添加 OpenAI 兼容服务商
+2. BaseURL 填：`http://lobe-switch-panel-<你的Service名>.ns-<ns>:3000/v1`（注意带 `/v1`）
+3. API Key 填：上游 DashScope key 或用 switch-panel `?type=dashscope` 模板
+4. 模型服务商改用 text-embedding-3-small（自动映射 qwen3.7-text-embedding）
+
+### 🛡 防滥用（可选）
+- 环境变量 `EMBEDDING_PROXY_TOKEN` 设置后，请求必须带 `X-Proxy-Token: <值>` 头，否则 401
+- LobeHub 服务商设置里无法自定义头时，可搭配`?type=dashscope&token=<值>`查询参数
+
+### 🧪 回归测试
+```bash
+node test-proxy.js   # mock 上游，验证 1/49/100 条拆批合并 + chat 透传 + 非法输入
+```

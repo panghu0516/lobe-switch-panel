@@ -521,6 +521,9 @@ const app = express();
 app.use(cookieParser());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+// LobeHub 模型服务商代理（embedding 拆批 + 透传），挂 /v1/*
+const embeddingProxy = require('./embedding-proxy');
+app.use(embeddingProxy);
 app.use(session({
   secret: SESSION_SECRET,
   resave: false,
