@@ -72,9 +72,9 @@ const BACKUP_TIMES_ENV = (process.env.BACKUP_TIMES || '').split(',').map(s => s.
 // 面板自备备份配置（优先）：配了就不再依赖 CronJob 动态读取
 const BACKUP_IMAGE = process.env.BACKUP_IMAGE || '';
 const BACKUP_PULL_SECRET = unescapeEnvVal(process.env.BACKUP_PULL_SECRET) || '';
-// 备份 Job 资源配额（128Mi 实测 OOM，默认 512Mi；可用环境变量覆盖）
+// 备份 Job 资源配额（落盘版备份镜像内存峰值 <30Mi，默认 128Mi；可用环境变量覆盖）
 const BACKUP_JOB_CPU = process.env.BACKUP_JOB_CPU || '100m';
-const BACKUP_JOB_MEM = process.env.BACKUP_JOB_MEM || '512Mi';
+const BACKUP_JOB_MEM = process.env.BACKUP_JOB_MEM || '128Mi';
 // # 号实测在 Sealos env 中保存会被截断（连 \# 也会被截）。
 // 约定：填写侧用 URL 编码 %23 表示字面 #（完全不含 # 字符），运行时统一还原。
 //   示例：密码 p@ss#word -> 填 p@ss%23word；若值本身要字面 %23 -> 填 %2523。

@@ -7,6 +7,7 @@ on:
       - 'Dockerfile'
       - 'entrypoint.sh'
       - 'src/**'
+      - 'backup-image/**'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -23,12 +24,23 @@ jobs:
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
-      - name: Build and push (latest + versioned)
+      - name: Compute version tag
+        run: echo "VERSION_TAG=v$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Build and push panel (latest + versioned)
         run: |
           set -eu
-          VERSION_TAG="v$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
           IMG="${{ secrets.ACR_REGISTRY }}/tigerhuang/lobe-switch-panel"
           echo "pushing $IMG:latest + $IMG:$VERSION_TAG"
           docker build -t "$IMG:latest" -t "$IMG:$VERSION_TAG" .
           docker push "$IMG:latest"
           docker push "$IMG:$VERSION_TAG"
+
+      - name: Build and push backup image (latest + versioned)
+        run: |
+          set -eu
+          BK="${{ secrets.ACR_REGISTRY }}/tigerhuang/pg-backup-s3-pg17"
+          echo "pushing $BK:latest + $BK:$VERSION_TAG"
+          docker build -t "$BK:latest" -t "$BK:$VERSION_TAG" ./backup-image
+          docker push "$BK:latest"
+          docker push "$BK:$VERSION_TAG"
