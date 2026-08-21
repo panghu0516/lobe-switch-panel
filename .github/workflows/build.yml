@@ -1,0 +1,34 @@
+name: Build and Push to ACR
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'Dockerfile'
+      - 'entrypoint.sh'
+      - 'src/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to ACR
+        uses: aliyun/acr-login@v1
+        with:
+          login-server: ${{ secrets.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push (latest + versioned)
+        run: |
+          set -eu
+          VERSION_TAG="v$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+          IMG="${{ secrets.ACR_REGISTRY }}/tigerhuang/lobe-switch-panel"
+          echo "pushing $IMG:latest + $IMG:$VERSION_TAG"
+          docker build -t "$IMG:latest" -t "$IMG:$VERSION_TAG" .
+          docker push "$IMG:latest"
+          docker push "$IMG:$VERSION_TAG"
