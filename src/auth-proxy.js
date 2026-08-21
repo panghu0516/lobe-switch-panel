@@ -4,13 +4,15 @@
  *
  * 监听 DOOR_PORT（默认 8080），对公网流量做统一认证：
  *   - 未登录 / Cookie 无效        → 302 → /login（内嵌极简登录页，无外部资源，几 KB）
- *   - POST /login 密码错误        → 302 → /login?err=1 回显错误
- *   - POST /login 密码正确        → Set-Cookie(HMAC 签名, HttpOnly, SameSite=Lax, TTL) → 302 回原路径
+ *   - POST /login 动态码错误       → 302 → /login?err=1 回显错误
+ *   - POST /login 动态码正确       → Set-Cookie(HMAC 签名, HttpOnly, SameSite=Lax, TTL) → 302 回原路径
  *   - GET  /logout               → 清除 Cookie → 302 /login
  *   - 已登录（Cookie 有效）且 Host 在路由表 → 反代到内网目标（流式透传，支持 SSE）
  *
+ * 登录方式：TOTP 动态码（与面板共用同一 TOTP_SECRET，一个码两边通用，无长密码）。
+ *
  * 环境变量（真值一律由 Sealos 注入，不进代码/仓库）：
- *   DOOR_PASSWORD    登录密码（必填，缺失拒绝启动）
+ *   TOTP_SECRET / DOOR_TOTP_SECRET  动态码密钥（DOOR_TOTP_SECRET 优先，缺省回退 TOTP_SECRET；必填，缺失拒绝启动）
  *   DOOR_SECRET      Cookie 签名密钥，>=16 字节（必填，缺失拒绝启动）
  *   DOOR_COOKIE_TTL  Cookie 有效期（秒），默认 604800（7 天）
  *   DOOR_PORT         监听端口，默认 8080
@@ -23,10 +25,11 @@ const http = require('http');
 const crypto = require('crypto');
 const express = require('express');
 const cookieParser = require('cookie-parser');
+const speakeasy = require('speakeasy');
 
 /* ---------------- 配置 ---------------- */
 const PORT = parseInt(process.env.DOOR_PORT || '8080', 10);
-const PASSWORD = process.env.DOOR_PASSWORD || '';
+const TOTP = process.env.DOOR_TOTP_SECRET || process.env.TOTP_SECRET || '';
 const SECRET = process.env.DOOR_SECRET || '';
 const COOKIE_TTL = parseInt(process.env.DOOR_COOKIE_TTL || String(7 * 24 * 3600), 10);
 const COOKIE_NAME = 'door_token';
@@ -35,6 +38,7 @@ const DISABLED = process.env.DOOR_DISABLE === '1';
 const routes = {
   'lobe.tigerhu.xyz': 'http://lobehub-v2-ceigycuepnks.ns-feotrwac:3210',
   'panel.tigerhu.xyz': 'http://127.0.0.1:3000',
+  'opencode.tigerhu.xyz': 'http://my-devbox-qzuwpllzwwkz.ns-feotrwac.svc.cluster.local:4096',
 };
 try {
   if (process.env.DOOR_ROUTES) {
@@ -46,8 +50,8 @@ try {
 
 /* ---------------- 启动保护 ---------------- */
 if (!DISABLED) {
-  if (!PASSWORD) {
-    console.error('[auth-proxy] 缺少 DOOR_PASSWORD，拒绝启动（请配置环境变量）');
+  if (!TOTP) {
+    console.error('[auth-proxy] 缺少动态码密钥（DOOR_TOTP_SECRET / TOTP_SECRET），拒绝启动（请配置环境变量）');
     process.exit(1);
   }
   if (!SECRET || Buffer.byteLength(SECRET) < 16) {
@@ -119,8 +123,9 @@ function renderLogin(next, hasError) {
   h1 { font-size:18px; margin:0 0 18px; text-align:center; }
   .err { background:#3a1d21; color:#ff9b9b; border:1px solid #6b2a31; border-radius:8px;
          font-size:13px; padding:8px 10px; margin-bottom:14px; }
-  input[type=password] { width:100%; padding:10px 12px; margin-bottom:14px; background:#0d1526;
-         border:1px solid #2c3a58; border-radius:8px; color:#e6edf3; font-size:15px; }
+  input[type=text], input[type=tel] { width:100%; padding:10px 12px; margin-bottom:14px; background:#0d1526;
+         border:1px solid #2c3a58; border-radius:8px; color:#e6edf3; font-size:15px; text-align:center;
+         letter-spacing:6px; font-family:ui-monospace,SFMono-Regular,monospace; }
   button { width:100%; padding:11px; background:#2f81f7; color:#fff; border:0; border-radius:8px;
          font-size:15px; cursor:pointer; }
   button:active { opacity:.85; }
@@ -130,13 +135,13 @@ function renderLogin(next, hasError) {
 <body>
 <div class="card">
 <h1>入口认证</h1>
-${hasError ? '<div class="err">密码错误，请重试</div>' : ''}
+${hasError ? '<div class="err">动态码错误或已过期，请重试</div>' : ''}
 <form method="post" action="/login">
   <input type="hidden" name="next" value="${esc(next)}">
-  <input type="password" name="password" placeholder="请输入访问密码" autofocus autocomplete="current-password">
+  <input type="tel" name="token" placeholder="6 位动态码" maxlength="6" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" autofocus>
   <button type="submit">进入</button>
 </form>
-<div class="tip">仅限本人使用</div>
+<div class="tip">输入 Authenticator 里当前 6 位动态码</div>
 </div>
 </body>
 </html>`;
@@ -198,7 +203,9 @@ app.get('/login', (req, res) => {
 
 app.post('/login', (req, res) => {
   const next = sanitizeNext(req.body && req.body.next);
-  if (DISABLED || safeEqual(req.body && req.body.password, PASSWORD)) {
+  const token = String((req.body && req.body.token) || '').trim();
+  const ok = DISABLED || speakeasy.totp.verify({ secret: TOTP, encoding: 'base32', token, window: 1 });
+  if (ok) {
     res.set('Set-Cookie', `${COOKIE_NAME}=${issueToken()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${COOKIE_TTL}`)
       .redirect(next || '/');
   } else {
