@@ -368,6 +368,46 @@ function buildResources(mem, cpu) {
   };
 }
 
+// K8s quantity → 数值（CPU 毫核），用于规范化比较。
+// K8s 读写回会规范化字符串（0.5→500m、1000m→1 等），不能直接用原始字符串比较。
+function cpuMillis(q) {
+  if (q == null) return null;
+  const s = String(q).trim();
+  if (!/^[0-9]+(\.[0-9]+)?m?$/.test(s)) return null;
+  const n = parseFloat(s);
+  return isNaN(n) ? null : Math.round(n * (s.endsWith('m') ? 1 : 1000));
+}
+
+// K8s quantity → 字节数，用于规范化比较（0.5Gi→512Mi、1024Mi→1Gi、1G→1000000000 等）
+function memBytes(q) {
+  if (q == null) return null;
+  const s = String(q).trim();
+  const m = /^([0-9]+(\.[0-9]+)?)\s*(k|ki|m|mi|g|gi|t|ti)?$/i.exec(s);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  if (isNaN(n)) return null;
+  const mult = { '': 1, k: 1e3, ki: 1024, m: 1e6, mi: 1048576, g: 1e9, gi: 1073741824, t: 1e12, ti: 1099511627776 }[(m[3] || '').toLowerCase()];
+  if (mult === undefined) return null;
+  return Math.round(n * mult);
+}
+
+function qtyCpuEq(a, b) {
+  const x = cpuMillis(a), y = cpuMillis(b);
+  return x != null && y != null && x === y;
+}
+function qtyMemEq(a, b) {
+  const x = memBytes(a), y = memBytes(b);
+  return x != null && y != null && x === y;
+}
+// 按数值比较两份 resources（requests/limits × cpu/memory），容忍 K8s 规范化表示差异
+function resourcesEq(cur, target) {
+  return !!cur && !!cur.requests && !!cur.limits && !!target && !!target.requests && !!target.limits &&
+    qtyCpuEq(cur.requests.cpu, target.requests.cpu) &&
+    qtyMemEq(cur.requests.memory, target.requests.memory) &&
+    qtyCpuEq(cur.limits.cpu, target.limits.cpu) &&
+    qtyMemEq(cur.limits.memory, target.limits.memory);
+}
+
 // key: 'lobehub' | 'devbox' | 'paradedb' -> 对应 MODE_TARGETS 里 name
 function targetFor(key) {
   const nameMap = { lobehub: 'lobehub-v2', devbox: 'my-devbox', paradedb: 'lobehub-paradedb' };
@@ -397,11 +437,7 @@ async function switchMode(modeKey) {
       const c = cfg[key];
       const target = buildResources(c.mem, c.cpu);
       const cur = saved[key];
-      const same = cur && cur.requests && cur.limits &&
-        cur.requests.cpu === target.requests.cpu &&
-        cur.requests.memory === target.requests.memory &&
-        cur.limits.cpu === target.limits.cpu &&
-        cur.limits.memory === target.limits.memory;
+      const same = resourcesEq(cur, target);
       if (same) { applied[key] = true; continue; }
       await kubePatchResources(t.kind, t.name, target);
       applied[key] = true;
@@ -456,8 +492,8 @@ async function kubeVerifyResources(kind, name, expect) {
   const cur = await kubeGetFull(kind, name);
   const r = cur.resources;
   if (!r || !r.requests || !r.limits) return false;
-  const ok = r.requests.cpu === expect.cpu && r.requests.memory === expect.mem &&
-             r.limits.cpu === expect.cpu && r.limits.memory === expect.mem;
+  const ok = qtyCpuEq(r.requests.cpu, expect.cpu) && qtyMemEq(r.requests.memory, expect.mem) &&
+             qtyCpuEq(r.limits.cpu, expect.cpu) && qtyMemEq(r.limits.memory, expect.mem);
   return ok;
 }
 
