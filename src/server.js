@@ -75,6 +75,8 @@ const BACKUP_PULL_SECRET = unescapeEnvVal(process.env.BACKUP_PULL_SECRET) || '';
 // 备份 Job 资源配额（落盘版备份镜像内存峰值 <30Mi，默认 128Mi；可用环境变量覆盖）
 const BACKUP_JOB_CPU = process.env.BACKUP_JOB_CPU || '100m';
 const BACKUP_JOB_MEM = process.env.BACKUP_JOB_MEM || '128Mi';
+// 备份 Job 失败重试次数（默认 1 次，容忍冷拉镜像等瞬时失败）
+const BACKUP_JOB_RETRY = parseInt(process.env.BACKUP_JOB_RETRY || '1', 10);
 // # 号实测在 Sealos env 中保存会被截断（连 \# 也会被截）。
 // 约定：填写侧用 URL 编码 %23 表示字面 #（完全不含 # 字符），运行时统一还原。
 //   示例：密码 p@ss#word -> 填 p@ss%23word；若值本身要字面 %23 -> 填 %2523。
@@ -518,7 +520,7 @@ async function triggerBackup() {
     kind: 'Job',
     metadata: { name: jobName, namespace: BACKUP_NAMESPACE, labels: { app: 'lobe-switch-backup', 'app.kubernetes.io/managed-by': 'lobe-switch-panel' } },
     spec: {
-      backoffLimit: 0,
+      backoffLimit: BACKUP_JOB_RETRY,
       activeDeadlineSeconds: 600,
       template: {
         spec: {
