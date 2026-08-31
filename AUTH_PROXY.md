@@ -25,11 +25,12 @@ LobeHub 公网入口统一认证网关，并入驻本镜像（`src/auth-proxy.js
 | `DOOR_COOKIE_TTL` | 否 | Cookie 有效期秒，默认 `604800`（7 天） |
 | `DOOR_PORT` | 否 | 监听端口，默认 `8080` |
 | `DOOR_ROUTES` | 否 | JSON `{"host":"target"}`，与内置映射合并（内置默认：`lobe.tigerhu.xyz → lobehub-v2:3210`、`panel.tigerhu.xyz → 127.0.0.1:3000`、`opencode.tigerhu.xyz → devbox:4096`） |
+| `DOOR_PUBLIC_PREFIXES` | 否 | 免认证公开路径前缀，逗号分隔，默认 `/f/`（LobeHub 文件代理 public-by-id，模型读图/AI 分享链接需匿名可 fetch） |
 | `DOOR_DISABLE` | 否 | `"1"` 时跳过认证直通（仅调试） |
 
 ## 约定
 
 - **健康检查**：`GET /health -> 200 OK`（Sealos 探针配在 8080）
-- **放行路径**：`/health`、`/login`、`/logout`；其余全部先过认证；未登录一律 `302 /login?next=<原路径>`
+- **放行路径**：`/health`、`/login`、`/logout`，以及 `DOOR_PUBLIC_PREFIXES` 命中的前缀（默认 `/f/`，LobeHub 文件代理，public by id）；其余全部先过认证；未登录一律 `302 /login?next=<原路径>`
 - **反代**：仅普通 HTTP（流式，SSE 可透传）；WebSocket upgrade 返回 501（gateway 设备接入走隧道，不经过门卫）
 - **安全**：Cookie HMAC 签名防篡改、过期自动失效；登录页 `Cache-Control: no-store`；`next` 仅允许站内相对路径（防开放重定向）

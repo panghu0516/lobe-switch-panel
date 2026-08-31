@@ -17,6 +17,9 @@
  *   DOOR_COOKIE_TTL  Cookie 有效期（秒），默认 604800（7 天）
  *   DOOR_PORT         监听端口，默认 8080
  *   DOOR_ROUTES       JSON: {"host":"target"}，与内置映射合并（内置可被覆盖）
+ *   DOOR_PUBLIC_PREFIXES  免认证公开路径前缀，逗号分隔，默认 "/f/"
+ *                     （LobeHub 文件代理 /f/:id 设计为 public by id：URL 嵌在裸 <img>/
+ *                      分享给 AI 的链接里，都无法携带 Cookie；模型读图必须能匿名 fetch）
  *   DOOR_DISABLE      "1" 时完全跳过认证直通（仅调试，不推荐）
  */
 'use strict';
@@ -34,6 +37,10 @@ const SECRET = process.env.DOOR_SECRET || '';
 const COOKIE_TTL = parseInt(process.env.DOOR_COOKIE_TTL || String(7 * 24 * 3600), 10);
 const COOKIE_NAME = 'door_token';
 const DISABLED = process.env.DOOR_DISABLE === '1';
+const PUBLIC_PREFIXES = (process.env.DOOR_PUBLIC_PREFIXES ?? '/f/')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 const routes = {
   'lobe.tigerhu.xyz': 'http://lobehub-v2-ceigycuepnks.ns-feotrwac:3210',
@@ -93,6 +100,10 @@ function verifyToken(token) {
   } catch {
     return false;
   }
+}
+
+function isPublicPath(pathname) {
+  return PUBLIC_PREFIXES.some((p) => pathname.startsWith(p));
 }
 
 function sanitizeNext(v) {
@@ -219,7 +230,7 @@ app.get('/logout', (req, res) => {
 });
 
 app.use((req, res) => {
-  if (DISABLED || verifyToken(req.cookies && req.cookies[COOKIE_NAME])) {
+  if (DISABLED || isPublicPath(req.path) || verifyToken(req.cookies && req.cookies[COOKIE_NAME])) {
     proxy(req, res);
     return;
   }
@@ -228,5 +239,5 @@ app.use((req, res) => {
 
 /* ---------------- 启动 ---------------- */
 app.listen(PORT, () => {
-  console.log(`[auth-proxy] door listening on :${PORT} (routes: ${Object.keys(routes).join(', ')})`);
+  console.log(`[auth-proxy] door listening on :${PORT} (routes: ${Object.keys(routes).join(', ')}) (public: ${PUBLIC_PREFIXES.join(', ') || 'none'})`);
 });
