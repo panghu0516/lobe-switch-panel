@@ -9,7 +9,7 @@
 | 命名空间 | `ns-feotrwac` |
 | 容器端口 | 3000 |
 | 白名单 GitHub 用户名 | `panghu0516` |
-| 纳管应用 | lobehub-v2(StatefulSet)、lobehub-paradedb(StatefulSet)、my-devbox(StatefulSet)、device-gateway(Deployment) |
+| 纳管应用 | lobehub-v2(StatefulSet)、lobehub-paradedb(StatefulSet)、my-devbox(StatefulSet)、device-gateway(Deployment)、redis(Deployment, 2026-08-31 接入一键启停) |
 
 ## 1. 终端环境说明
 
