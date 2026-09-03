@@ -22,12 +22,13 @@
  *                      分享给 AI 的链接里，都无法携带 Cookie；模型读图必须能匿名 fetch）
  *   DOOR_DISABLE      "1" 时完全跳过认证直通（仅调试，不推荐）
  *
- * 路径前缀分流（2026-09-03 门卫注入式，取消应急入口后）：
- *   /opencode-panel 与 /proto 前缀 → 一律转发到 devbox 4096 前置代理（front-proxy.js），
- *   注入 x-door-key 头；其余路径保持 host → DOOR_ROUTES 逻辑不变。
- *   DOOR_OPENCEPANEL_UPSTREAM  4096 前置代理地址（如 http://my-devbox-xxx:4096）
- *   DOOR_FORWARD_KEY           注入用的 x-door-key 值，须与 front-proxy.json 的 doorKey 一致
- *   两 env 缺失 → 这两个前缀返回 501（提示未配置，不崩）；面板纯 HTTP，无需 WebSocket 透传。
+ * 路径路由表（2026-09-03 定稿，门卫路径分流）：
+ *   DOOR_ROUTE_TABLE  JSON 数组 [{"host":"...","prefix":"/opencode-panel","target":"http://...:4900"},...]
+ *     - host + 最长 prefix 命中 → 整体转发到 target（原始路径原样保留，不重写）
+ *     - 未命中任何路径规则 → 落回 DOOR_ROUTES 整域路由
+ *     - 缺失/解析失败 → console.error 忽略，不影响现有功能
+ *   serve 4096 不再被反代；devbox 内网 4900 小服务承载 /opencode-panel 面板与 /proto 原型。
+ *   登录校验对所有命中（含路径规则）生效（路由在登录门卫之后）。
  */
 'use strict';
 
@@ -44,8 +45,6 @@ const SECRET = process.env.DOOR_SECRET || '';
 const COOKIE_TTL = parseInt(process.env.DOOR_COOKIE_TTL || String(7 * 24 * 3600), 10);
 const COOKIE_NAME = 'door_token';
 const DISABLED = process.env.DOOR_DISABLE === '1';
-const OPENCODE_UPSTREAM = process.env.DOOR_OPENCEPANEL_UPSTREAM || '';
-const FORWARD_KEY = process.env.DOOR_FORWARD_KEY || '';
 const PUBLIC_PREFIXES = (process.env.DOOR_PUBLIC_PREFIXES ?? '/f/')
   .split(',')
   .map((s) => s.trim())
@@ -62,6 +61,21 @@ try {
   }
 } catch (e) {
   console.error('[auth-proxy] DOOR_ROUTES JSON 解析失败，仅用内置映射:', e.message);
+}
+
+/* 路径路由表：host+最长 prefix 命中 → target；未命中落回 routes */
+let ROUTE_TABLE = [];
+try {
+  if (process.env.DOOR_ROUTE_TABLE) {
+    const arr = JSON.parse(process.env.DOOR_ROUTE_TABLE);
+    if (!Array.isArray(arr)) throw new Error('DOOR_ROUTE_TABLE 必须是 JSON 数组');
+    ROUTE_TABLE = arr
+      .filter((e) => e && typeof e.host === 'string' && typeof e.prefix === 'string' && typeof e.target === 'string')
+      .map((e) => ({ host: e.host, prefix: e.prefix, target: e.target }));
+  }
+} catch (e) {
+  console.error('[auth-proxy] DOOR_ROUTE_TABLE 解析失败，忽略路径规则（不影响现有路由）:', e.message);
+  ROUTE_TABLE = [];
 }
 
 /* ---------------- 启动保护 ---------------- */
@@ -168,9 +182,15 @@ ${hasError ? '<div class="err">动态码错误或已过期，请重试</div>' : 
 }
 
 /* ---------------- 反代 ---------------- */
-// 路径前缀分流（门卫注入式，2026-09-03）：这两前缀归 devbox 4096 前置代理，不走 host 路由
-function isOpenCodePath(pathname) {
-  return pathname.startsWith('/opencode-panel') || pathname.startsWith('/proto');
+// 路径路由表（2026-09-03 定稿）：host + 最长 prefix 命中 → target（保留原始路径）
+function routeTableTarget(pathname, host) {
+  let best = null;
+  for (const e of ROUTE_TABLE) {
+    if (e.host === host && pathname.startsWith(e.prefix) && (!best || e.prefix.length > best.prefix.length)) {
+      best = e;
+    }
+  }
+  return best ? best.target : null;
 }
 
 function fwdHeaders(u, host, extra) {
@@ -178,7 +198,6 @@ function fwdHeaders(u, host, extra) {
   const hop = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
     'te', 'trailers', 'transfer-encoding', 'upgrade', 'host'];
   hop.forEach((k) => delete headers[k]);
-  delete headers['x-door-key']; // 客户端值一律作废，只认注入值
   headers.host = u.host;
   headers['x-forwarded-for'] = host.remoteAddress || '';
   headers['x-forwarded-proto'] = 'https';
@@ -186,46 +205,10 @@ function fwdHeaders(u, host, extra) {
   return headers;
 }
 
-function opencodeProxy(req, res) {
-  if (!OPENCODE_UPSTREAM) {
-    return res.status(501).send('opencode-panel/proto 未配置：缺环境变量 DOOR_OPENCEPANEL_UPSTREAM');
-  }
-  if (!FORWARD_KEY) {
-    return res.status(501).send('opencode-panel/proto 未配置：缺环境变量 DOOR_FORWARD_KEY');
-  }
-  if ((req.headers.upgrade || '').toLowerCase() === 'websocket') {
-    return res.status(501).send('WebSocket upgrade not supported via opencode-panel proxy');
-  }
-  let u;
-  try { u = new URL(OPENCODE_UPSTREAM); } catch { return res.status(500).send('Bad DOOR_OPENCEPANEL_UPSTREAM'); }
-  const hostName = (req.headers.host || '').split(':')[0];
-  const headers = fwdHeaders(u, { remoteAddress: req.socket.remoteAddress || '', name: hostName }, req.headers);
-  headers['x-door-key'] = FORWARD_KEY; // 门卫注入：front-proxy 只认这个头
-
-  const proxyReq = http.request({
-    hostname: u.hostname,
-    port: u.port || 80,
-    path: req.originalUrl || '/', // 前缀原样透传（/opencode-panel*、/proto*），front-proxy 内部归一
-    method: req.method,
-    headers,
-  }, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-    proxyRes.pipe(res);
-  });
-  proxyReq.on('error', (e) => {
-    console.error('[auth-proxy] opencode upstream error:', e.message);
-    if (!res.headersSent) res.status(502).send('Bad Gateway');
-    else res.destroy();
-  });
-  req.pipe(proxyReq);
-}
-
 function proxy(req, res) {
-  if (isOpenCodePath(req.path)) {
-    return opencodeProxy(req, res);
-  }
   const host = (req.headers.host || '').split(':')[0];
-  const target = routes[host];
+  // 先路径规则，未命中落回整域 DOOR_ROUTES
+  const target = routeTableTarget(req.path, host) || routes[host];
   if (!target) {
     return res.status(404).send('Not Found');
   }
@@ -240,7 +223,7 @@ function proxy(req, res) {
   const proxyReq = http.request({
     hostname: u.hostname,
     port: u.port || 80,
-    path: req.originalUrl || '/',
+    path: req.originalUrl || '/', // 原始路径原样透传，不重写
     method: req.method,
     headers,
   }, (proxyRes) => {
