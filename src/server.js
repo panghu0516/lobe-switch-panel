@@ -97,6 +97,48 @@ const PANEL_BACKUP_ENV = [
   ['TZ', process.env.TZ || 'Asia/Shanghai']
 ].filter(([k, v]) => v).map(([name, value]) => ({ name, value: unescapeEnvVal(value) }));
 
+// ══ OpenCode 模式开关（devbox 适配器通道，2026-09-03 方案B）══
+// 需要环境变量: DEVBOX_ADAPTER_URL（如 http://<my-devbox-svc>:8089）、JIT_SIGNING_KEY（与适配器一致）
+// 凭证零落盘：panel 只在命令串里写 {KEY} 占位符文本，真值由适配器在执行瞬态替换
+const OC_ADAPTER_URL = (process.env.DEVBOX_ADAPTER_URL || '').replace(/\/+$/, '');
+const OC_JIT_KEY = unescapeEnvVal(process.env.JIT_SIGNING_KEY) || '';
+const OC_MODE_SCRIPT = 'bash /config/scripts/opencode-mode.sh';
+
+function ocConfigured() { return !!(OC_ADAPTER_URL && OC_JIT_KEY); }
+
+function ocJitToken() {
+  const h = 'obx_jit_v1';
+  const now = Math.floor(Date.now() / 1000);
+  const claims = { iss: 'lobe-switch-panel', sub: 'lobe-switch-panel', iat: now, exp: now + 600 };
+  const p = h + '.' + Buffer.from(JSON.stringify(claims)).toString('base64url');
+  return p + '.' + crypto.createHmac('sha256', OC_JIT_KEY).update(p).digest('base64url');
+}
+
+// 返回 { code, stdout, stderr }；不抛异常，由调用方按 exit code 分流
+async function ocRun(command, timeoutMs) {
+  const res = await fetch(OC_ADAPTER_URL + '/api/v1/commands/terminal', {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + ocJitToken(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ command, timeout_ms: timeoutMs || 60000 }),
+  });
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error('adapter HTTP ' + res.status + (d.error ? ': ' + d.error : ''));
+  return { code: d.exit_code, stdout: String(d.stdout || ''), stderr: String(d.stderr || '') };
+}
+
+function ocStatusParse(stdout) {
+  const line = String(stdout || '').split('\n').map(l => l.trim()).find(l => l.startsWith('{'));
+  return line ? JSON.parse(line) : null;
+}
+
+// 冷启动所需凭证：以 {KEY} 占位符形式放命令行（适配器执行时瞬态替换真值）
+function ocEnvPrefix(target) {
+  if (target === 'lobe') return 'LOBEHUB_CLI_API_KEY={LOBEHUB_CLI_API_KEY} ';
+  return 'OPENCODE_LLM_API_KEY={OPENCODE_LLM_API_KEY} OPENCODE_LLM_BASE_URL={OPENCODE_LLM_BASE_URL} '
+    + 'OPENCODE_DEFAULT_MODEL={OPENCODE_DEFAULT_MODEL} OPENCODE_SERVER_PASSWORD={OPENCODE_SERVER_PASSWORD} ';
+}
+
+
 // 模式切换针对的三个维度应用（lobe 主服务 + devbox + paradedb 数据库）
 const MODE_TARGETS = [
   { kind: 'StatefulSet', name: 'lobehub-v2', label: 'LobeHub' },
@@ -741,6 +783,12 @@ app.get('/', (req, res) => {
 <div id="msg" style="margin:8px 0;font-weight:bold"></div>
 
 <div class="card">
+<h2>🔀 OpenCode 模式</h2>
+<div id="oc"></div>
+<div id="ocMsg" class="small" style="margin-top:8px"></div>
+</div>
+
+<div class="card">
 <h2>🚦 资源与应用</h2>
 <div id="res"></div>
 <div id="list" style="margin-top:10px"></div>
@@ -767,7 +815,55 @@ const LOGIN_URL='${AUTH_MODE === 'totp' ? '/totp/verify' : '/auth/login'}';
 async function j(url,opts){const r=await fetch(url,opts);if(r.status===401){window.location=LOGIN_URL;return null;}return r.json();}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 
-async function load(){await loadStatus();await loadResources();await loadModes();await loadBackup();}
+async function load(){await loadOpencode();await loadStatus();await loadResources();await loadModes();await loadBackup();}
+
+/* ---- OpenCode 模式卡 ---- */
+let OC_POLL = null;
+async function loadOpencode(){
+const d=await j('/opencode');const el=document.getElementById('oc');if(!el)return;
+if(!d||d.error||d.configured===false){el.innerHTML='<span class=err>'+esc((d&&(d.detail||d.error))||'查询失败')+'</span>';return;}
+const dot=s=>s==='running'?'<span class=running>●运行中</span>':(s==='paused'?'<span class=paused>⏸ 已挂起</span>':'<span class=err>○ 未运行</span>');
+el.innerHTML='<div class=row><span>当前模式</span><b>'+(d.mode==='serve'?'🖥 Serve（网页端 4096）':'🤖 Lobe（LobeHub 对话）')+'</b></div>'
++'<div class=row><span>serve（4096 网页端）</span>'+dot(d.serve.state)+'</div>'
++'<div class=row><span>daemon（LobeHub 对话）</span>'+dot(d.daemon.state)+'</div>'
++'<div style="margin-top:8px"><button class="mode-btn" data-active="'+(d.mode==='serve'?1:0)+'" onclick="ocSwitch(\'serve\')">🖥 切到 Serve</button>'
++'<button class="mode-btn" data-active="'+(d.mode==='lobe'?1:0)+'" onclick="ocSwitch(\'lobe\')">🤖 切到 Lobe</button></div>'
++'<div class=small style="margin-top:6px">两模式互斥：切换会中断另一侧正在进行的响应/任务；底层共用同一个数据库。</div>';
+}
+async function ocSwitch(target){
+const m=document.getElementById('ocMsg');if(!m)return;
+m.style.color='#d29922';m.textContent='⏳ 检测任务状态...';
+const d=await j('/opencode');if(!d||!d.ok){m.style.color='#f85149';m.textContent='❌ '+esc((d&&(d.detail||d.error))||'查询失败');return;}
+const busy=target==='serve'?d.busy.toServe:d.busy.toLobe;
+const busyDesc=target==='serve'?'Lobe 侧有任务/对话正在进行':'Serve 网页端正在响应';
+let wait=false;
+if(busy){
+if(!confirm('检测到：'+busyDesc+'。\\n确认后将等待其结束后自动切换（最长等 2 小时），期间请勿开始新任务，并保持本页打开。\\n继续？')){m.textContent='';return;}
+wait=true;
+}else{
+if(!confirm('确认切换到 '+(target==='serve'?'Serve（网页端 4096）':'Lobe（LobeHub 对话）')+' 模式？\\n另一侧正在进行的响应/任务将被中断。')){m.textContent='';return;}
+}
+m.style.color='#d29922';m.textContent='⏳ 切换中...';
+const r=await j('/opencode/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target,wait})});
+if(!r)return;
+if(r.ok&&r.switched){m.style.color='#3fb950';m.textContent='✅ 已切换到 '+target+' 模式，正在刷新...';setTimeout(()=>window.location.reload(),1000);return;}
+if(r.ok&&r.waiting){m.style.color='#d29922';m.textContent='⏳ '+busyDesc+'，等待结束后自动切换（完成后本页自动刷新）...';ocPoll(target);return;}
+if(r.busy){m.style.color='#d29922';m.textContent='⚠️ '+esc(r.detail||'有任务进行中，未切换');return;}
+m.style.color='#f85149';m.textContent='❌ '+esc((r.detail?r.error+'：'+r.detail:r.error)||'切换失败');
+}
+async function ocPoll(target){
+if(OC_POLL)clearInterval(OC_POLL);
+const t0=Date.now();
+OC_POLL=setInterval(async()=>{
+const d=await j('/opencode');if(!d||!d.ok)return;
+if(d.mode===target){clearInterval(OC_POLL);OC_POLL=null;
+const m=document.getElementById('ocMsg');if(m){m.style.color='#3fb950';m.textContent='✅ 已切换到 '+target+' 模式，正在刷新...';}
+setTimeout(()=>window.location.reload(),1000);return;}
+if(Date.now()-t0>2.25*3600*1000){clearInterval(OC_POLL);OC_POLL=null;
+const m=document.getElementById('ocMsg');if(m){m.style.color='#f85149';m.textContent='❌ 等待超过 2 小时仍未切换（任务可能仍在运行），可稍后重试';}}
+},10000);
+}
+
 async function loadStatus(){
 const s=await j('/status');if(!s)return;const list=document.getElementById('list');
 const apps=(s&&s.apps)||[];const anyErr=apps.length===0;
@@ -928,6 +1024,55 @@ function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,m=>({'&':'
 });
 
 function escapeHtml(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
+/* ---------- OpenCode 模式开关（阶段1：仅按钮切换，无自动编排） ---------- */
+app.get('/opencode', requireAuth, requireTotp, async (req, res) => {
+  try {
+    if (!ocConfigured()) return res.json({ ok: false, configured: false, detail: '未配置 DEVBOX_ADAPTER_URL / JIT_SIGNING_KEY 环境变量' });
+    const r = await ocRun(OC_MODE_SCRIPT + ' status --json', 30000);
+    if (r.code !== 0) return res.json({ ok: false, configured: true, error: 'status 查询失败', detail: (r.stderr || r.stdout).slice(0, 300) });
+    const s = ocStatusParse(r.stdout);
+    if (!s) return res.json({ ok: false, configured: true, error: 'status 输出解析失败', detail: r.stdout.slice(0, 300) });
+    res.json({ ok: true, configured: true, ...s });
+  } catch (e) {
+    res.json({ ok: false, configured: ocConfigured(), error: '查询失败', detail: e.message });
+  }
+});
+
+app.post('/opencode/switch', requireAuth, requireTotp, async (req, res) => {
+  try {
+    if (!ocConfigured()) return res.json({ ok: false, error: '未配置 DEVBOX_ADAPTER_URL / JIT_SIGNING_KEY 环境变量' });
+    const target = req.body && req.body.target;
+    const wait = !!(req.body && req.body.wait);
+    if (target !== 'serve' && target !== 'lobe') return res.json({ ok: false, error: 'target 必须是 serve 或 lobe' });
+
+    // 排空检查（占用 = 另一侧有任务/响应进行中）
+    const sr = await ocRun(OC_MODE_SCRIPT + ' status --json', 30000);
+    const st = sr.code === 0 ? ocStatusParse(sr.stdout) : null;
+    const busy = st ? (target === 'serve' ? !!st.busy.toServe : !!st.busy.toLobe) : false;
+
+    if (!busy) {
+      // 直接切换（serve 优雅退出 + 可能的冷启动，给足 180s）
+      const r = await ocRun(ocEnvPrefix(target) + OC_MODE_SCRIPT + ' set ' + target, 180000);
+      if (r.code === 3) return res.json({ ok: false, busy: true, detail: (r.stdout || '').trim() || '检测到任务进行中，未切换' });
+      if (r.code !== 0) return res.json({ ok: false, error: '切换失败', detail: (r.stderr || r.stdout || '').trim().slice(0, 300) });
+      return res.json({ ok: true, switched: true, target });
+    }
+    if (!wait) {
+      return res.json({ ok: false, busy: true, detail: (target === 'serve' ? 'Lobe 侧有任务/对话进行中' : 'Serve 网页端正在响应') + '，未切换' });
+    }
+    // 用户已确认 → 后台等待排空后自动切换；前端轮询，完成后自动刷新
+    const cmd = ocEnvPrefix(target) + 'nohup ' + OC_MODE_SCRIPT + ' set ' + target
+      + ' --wait 7200 >> /config/logs/opencode-switch-job.log 2>&1 & echo BG_$!';
+    const r = await ocRun(cmd, 30000);
+    if (!/BG_\d+/.test(r.stdout)) return res.json({ ok: false, error: '后台切换任务创建失败', detail: (r.stdout || r.stderr || '').slice(0, 200) });
+    return res.json({ ok: true, waiting: true, target });
+  } catch (e) {
+    res.json({ ok: false, error: '切换失败', detail: e.message });
+  }
+});
+
+
 
 /* ---------- GitHub OAuth ---------- */
 app.get('/auth/login', (req, res) => {
