@@ -801,10 +801,13 @@ app.get('/', (req, res) => {
 </div>
 <script>
 const LOGIN_URL='${AUTH_MODE === 'totp' ? '/totp/verify' : '/auth/login'}';
-async function j(url,opts){const r=await fetch(url,opts);if(r.status===401){window.location=LOGIN_URL;return null;}return r.json();}
+async function j(url,opts){const c=new AbortController();const t=setTimeout(()=>c.abort(),15000);const r=await fetch(url,Object.assign({},opts,{signal:c.signal})).finally(()=>clearTimeout(t));if(r.status===401){window.location=LOGIN_URL;return null;}return r.json();}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 
-async function load(){await loadStatus();await loadResources();await loadModes();await loadBackup();await loadOcBackup();}
+function load(){
+  // 并行加载 + 各卡独立容错：一张卡挂起/报错不连累其他卡（2026-09-04 串行链全页空白事故）
+  [loadStatus,loadResources,loadModes,loadBackup,loadOcBackup].forEach(f=>f().catch(e=>{const m=document.getElementById('msg');if(m){m.style.color='#f85149';m.textContent='⚠️ '+f.name+' 加载失败: '+esc(e.message||e);}}));
+}
 
 // OpenCode 备份：触发 + 日志状态
 async function loadOcBackup(){
