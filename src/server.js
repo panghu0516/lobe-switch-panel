@@ -771,7 +771,7 @@ app.get('/', (req, res) => {
 <h2>🎛 OpenCode</h2>
 <div>
 <button class="mode-btn" onclick="window.open('/opencode-panel','_blank')">🎛 模式面板</button>
-<button class="mode-btn" onclick="window.open('/proto/doc-tree-strategy.html','_blank')">📐 原型展示</button>
+<button class="mode-btn" onclick="window.open('/proto/','_blank')">📐 原型展示</button>
 <button class="mode-btn" onclick="ocBackup()">💾 备份 opencode 库</button>
 </div>
 <div id="ocbk" class="small" style="margin-top:8px;color:#8b949e;word-break:break-all"></div>
