@@ -669,8 +669,12 @@ function scheduleBackups() {
 /* ================= 应用 ================= */
 const app = express();
 app.use(cookieParser());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// /opencode-panel、/proto 是流式转发路由（ocForward 用 req.pipe 透传）——body 必须保留原始流。
+// 若被全局 body 解析消费，转发时 0B body + 原 Content-Length → 上游(4900)死等 → CF 524
+// （实证 2026-09-04：POST /opencode-panel/api/switch 头到 body 0B）。故对这两前缀跳过解析。
+const OC_FWD_RE = /^\/(opencode-panel|proto)(\/|$)/;
+app.use((req, res, next) => OC_FWD_RE.test(req.path) ? next() : express.json()(req, res, next));
+app.use((req, res, next) => OC_FWD_RE.test(req.path) ? next() : express.urlencoded({ extended: true })(req, res, next));
 // LobeHub 模型服务商代理（embedding 拆批 + 透传），挂 /v1/*
 const embeddingProxy = require('./embedding-proxy');
 app.use(embeddingProxy);
