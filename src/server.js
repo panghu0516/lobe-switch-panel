@@ -818,7 +818,7 @@ async function loadOcBackup(){
     const d=await r.json().catch(()=>null);
     if(!d){el.textContent='';return;}
     const runHtml=d.running?'<span class="running">● 备份进行中…</span><br>':'';
-    const tail=(d.log||'').split('\n').filter(Boolean).slice(-4).map(esc).join('<br>');
+    const tail=(d.log||'').split('\\n').filter(Boolean).slice(-4).map(esc).join('<br>');
     el.innerHTML=runHtml+(tail||'暂无备份日志');
   }catch(e){el.textContent='';}
 }
