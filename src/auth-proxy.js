@@ -21,13 +21,6 @@
  *                     （LobeHub 文件代理 /f/:id 设计为 public by id：URL 嵌在裸 <img>/
  *                      分享给 AI 的链接里，都无法携带 Cookie；模型读图必须能匿名 fetch）
  *   DOOR_DISABLE      "1" 时完全跳过认证直通（仅调试，不推荐）
- *
- * 路径前缀分流（2026-09-03 门卫注入式，取消应急入口后）：
- *   /opencode-panel 与 /proto 前缀 → 一律转发到 devbox 4096 前置代理（front-proxy.js），
- *   注入 x-door-key 头；其余路径保持 host → DOOR_ROUTES 逻辑不变。
- *   DOOR_OPENCEPANEL_UPSTREAM  4096 前置代理地址（如 http://my-devbox-xxx:4096）
- *   DOOR_FORWARD_KEY           注入用的 x-door-key 值，须与 front-proxy.json 的 doorKey 一致
- *   两 env 缺失 → 这两个前缀返回 501（提示未配置，不崩）；面板纯 HTTP，无需 WebSocket 透传。
  */
 'use strict';
 
@@ -44,8 +37,6 @@ const SECRET = process.env.DOOR_SECRET || '';
 const COOKIE_TTL = parseInt(process.env.DOOR_COOKIE_TTL || String(7 * 24 * 3600), 10);
 const COOKIE_NAME = 'door_token';
 const DISABLED = process.env.DOOR_DISABLE === '1';
-const OPENCODE_UPSTREAM = process.env.DOOR_OPENCEPANEL_UPSTREAM || '';
-const FORWARD_KEY = process.env.DOOR_FORWARD_KEY || '';
 const PUBLIC_PREFIXES = (process.env.DOOR_PUBLIC_PREFIXES ?? '/f/')
   .split(',')
   .map((s) => s.trim())
@@ -168,62 +159,7 @@ ${hasError ? '<div class="err">动态码错误或已过期，请重试</div>' : 
 }
 
 /* ---------------- 反代 ---------------- */
-// 路径前缀分流（门卫注入式，2026-09-03）：这两前缀归 devbox 4096 前置代理，不走 host 路由
-function isOpenCodePath(pathname) {
-  return pathname.startsWith('/opencode-panel') || pathname.startsWith('/proto');
-}
-
-function fwdHeaders(u, host, extra) {
-  const headers = Object.assign({}, extra || {});
-  const hop = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-    'te', 'trailers', 'transfer-encoding', 'upgrade', 'host'];
-  hop.forEach((k) => delete headers[k]);
-  delete headers['x-door-key']; // 客户端值一律作废，只认注入值
-  headers.host = u.host;
-  headers['x-forwarded-for'] = host.remoteAddress || '';
-  headers['x-forwarded-proto'] = 'https';
-  headers['x-forwarded-host'] = host.name;
-  return headers;
-}
-
-function opencodeProxy(req, res) {
-  if (!OPENCODE_UPSTREAM) {
-    return res.status(501).send('opencode-panel/proto 未配置：缺环境变量 DOOR_OPENCEPANEL_UPSTREAM');
-  }
-  if (!FORWARD_KEY) {
-    return res.status(501).send('opencode-panel/proto 未配置：缺环境变量 DOOR_FORWARD_KEY');
-  }
-  if ((req.headers.upgrade || '').toLowerCase() === 'websocket') {
-    return res.status(501).send('WebSocket upgrade not supported via opencode-panel proxy');
-  }
-  let u;
-  try { u = new URL(OPENCODE_UPSTREAM); } catch { return res.status(500).send('Bad DOOR_OPENCEPANEL_UPSTREAM'); }
-  const hostName = (req.headers.host || '').split(':')[0];
-  const headers = fwdHeaders(u, { remoteAddress: req.socket.remoteAddress || '', name: hostName }, req.headers);
-  headers['x-door-key'] = FORWARD_KEY; // 门卫注入：front-proxy 只认这个头
-
-  const proxyReq = http.request({
-    hostname: u.hostname,
-    port: u.port || 80,
-    path: req.originalUrl || '/', // 前缀原样透传（/opencode-panel*、/proto*），front-proxy 内部归一
-    method: req.method,
-    headers,
-  }, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-    proxyRes.pipe(res);
-  });
-  proxyReq.on('error', (e) => {
-    console.error('[auth-proxy] opencode upstream error:', e.message);
-    if (!res.headersSent) res.status(502).send('Bad Gateway');
-    else res.destroy();
-  });
-  req.pipe(proxyReq);
-}
-
 function proxy(req, res) {
-  if (isOpenCodePath(req.path)) {
-    return opencodeProxy(req, res);
-  }
   const host = (req.headers.host || '').split(':')[0];
   const target = routes[host];
   if (!target) {
@@ -235,7 +171,14 @@ function proxy(req, res) {
   let u;
   try { u = new URL(target); } catch { return res.status(500).send('Bad upstream target'); }
 
-  const headers = fwdHeaders(u, { remoteAddress: req.socket.remoteAddress || '', name: host }, req.headers);
+  const headers = Object.assign({}, req.headers);
+  const hop = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'te', 'trailers', 'transfer-encoding', 'upgrade', 'host'];
+  hop.forEach((k) => delete headers[k]);
+  headers.host = u.host;
+  headers['x-forwarded-for'] = req.socket.remoteAddress || '';
+  headers['x-forwarded-proto'] = 'https';
+  headers['x-forwarded-host'] = host;
 
   const proxyReq = http.request({
     hostname: u.hostname,
