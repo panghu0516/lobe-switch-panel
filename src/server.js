@@ -5,6 +5,7 @@ const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const http = require('http');
 const https = require('https');
 const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
@@ -59,6 +60,8 @@ const ALLOWED_GITHUB_LOGIN = (process.env.ALLOWED_GITHUB_LOGIN || '').split(',')
 const SESSION_SECRET = unescapeEnvVal(process.env.SESSION_SECRET) || crypto.randomBytes(32).toString('hex');
 const TOTP_SECRET = unescapeEnvVal(process.env.TOTP_SECRET) || '';
 const AUTH_MODE = process.env.AUTH_MODE || 'both';
+// devbox 内网 opencode 面板/原型服务（4900）：/opencode-panel、/proto 门卫转发目标
+const OC_PANEL_TARGET = (process.env.OC_PANEL_UPSTREAM || 'http://my-devbox-qzuwpllzwwkz.ns-feotrwac.svc.cluster.local:4900').replace(/\/+$/, '');
 const KUBE_API_SERVER = (process.env.KUBE_API_SERVER || '').replace(/\/+$/, '');
 const KUBE_SA_TOKEN = unescapeEnvVal(process.env.KUBE_SA_TOKEN) || '';
 const KUBE_NAMESPACE = process.env.KUBE_NAMESPACE || 'default';
@@ -1184,6 +1187,42 @@ app.post('/resume', requireAuth, requireTotp, async (req, res) => {
   if (errors.length) return res.status(207).json({ ok: false, errors, partial: true });
   res.json({ ok: true });
 });
+
+/* ================= OC 面板/原型 门卫转发（2026-09-03 v3 定稿） ================= */
+// 原路径（含 query）整体透传至 OC_PANEL_TARGET（devbox 4900 内网小服务），不重写。
+// 复用 requireAuth + requireTotp：GitHub 登录 + TOTP 门卫在此生效（与其它受保护 API 同 gate）。
+// 纯 HTTP 面板/静态，无需 upgrade 透传；upstream 不可达 → 502。
+function forwardOcPanel(req, res) {
+  let u;
+  try { u = new URL(OC_PANEL_TARGET); } catch (e) { return res.status(500).send('Bad OC_PANEL_UPSTREAM'); }
+  const hop = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'te', 'trailers', 'transfer-encoding', 'upgrade', 'host'];
+  const headers = {};
+  Object.keys(req.headers).forEach((k) => { if (!hop.includes(k)) headers[k] = req.headers[k]; });
+  headers.host = u.host;
+  headers['x-forwarded-for'] = req.socket.remoteAddress || '';
+  headers['x-forwarded-proto'] = 'https';
+  headers['x-forwarded-host'] = req.headers.host || '';
+
+  const proxyReq = http.request({
+    hostname: u.hostname,
+    port: u.port || 80,
+    path: req.originalUrl || '/',
+    method: req.method,
+    headers,
+  }, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+  proxyReq.on('error', (e) => {
+    console.error('[oc-panel fwd] upstream error:', e.message);
+    if (!res.headersSent) res.status(502).send('Bad Gateway');
+    else res.destroy();
+  });
+  req.pipe(proxyReq);
+}
+
+app.all(['/opencode-panel', '/opencode-panel/*', '/proto', '/proto/*'], requireAuth, requireTotp, forwardOcPanel);
 
 /* ================= 启动 ================= */
 app.listen(PORT, () => {
