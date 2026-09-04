@@ -62,6 +62,9 @@ const TOTP_SECRET = unescapeEnvVal(process.env.TOTP_SECRET) || '';
 const AUTH_MODE = process.env.AUTH_MODE || 'both';
 // devbox 内网 opencode 面板/原型服务（4900）：/opencode-panel、/proto 门卫转发目标
 const OC_PANEL_TARGET = (process.env.OC_PANEL_UPSTREAM || 'http://my-devbox-qzuwpllzwwkz.ns-feotrwac.svc.cluster.local:4900').replace(/\/+$/, '');
+// opencode 库备份上传 S3 凭证（sealos env 注入；经 unescapeEnvVal 处理 # 转义）
+const OC_S3_ACCESS_KEY = unescapeEnvVal(process.env.OC_S3_ACCESS_KEY) || '';
+const OC_S3_SECRET_KEY = unescapeEnvVal(process.env.OC_S3_SECRET_KEY) || '';
 const KUBE_API_SERVER = (process.env.KUBE_API_SERVER || '').replace(/\/+$/, '');
 const KUBE_SA_TOKEN = unescapeEnvVal(process.env.KUBE_SA_TOKEN) || '';
 const KUBE_NAMESPACE = process.env.KUBE_NAMESPACE || 'default';
@@ -633,6 +636,9 @@ function scheduleBackups() {
         } catch (e) {
           console.error(`[backup] 定时备份失败: ${e.message}`);
         }
+        // opencode 库备份随每次 PG 备份时点触发；独立失败不影响 PG 结果
+        try { await triggerOcPanelBackup(); }
+        catch (e) { console.error(`[backup] opencode 定时备份失败: ${e.message}`); }
       }, { timezone: 'Asia/Shanghai' });
       backupCronTasks.push(task);
       console.log(`[backup] 已调度 ${timeStr} (cron: ${expr} @Asia/Shanghai)`);
@@ -741,7 +747,17 @@ app.get('/', (req, res) => {
 <style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;background:#0f1115;color:#e6e8eb}h1{font-size:22px;margin:0}button{font-size:15px;padding:10px 16px;border:none;border-radius:8px;cursor:pointer;margin:6px 6px 6px 0}.pause{background:#d64545;color:#fff}.resume{background:#2ea043;color:#fff}.logout{background:#333;color:#ccc}.card{background:#1c2128;padding:16px;border-radius:10px;margin:12px 0}.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #2a2f38;gap:8px}.running{color:#3fb950}.paused{color:#f85149}.err{color:#d29922}.ok{color:#3fb950}.mode-btn{background:#21262d;border:1px solid #30363d;color:#e6e8eb}.mode-btn[data-active="1"]{background:#1f6feb;border-color:#1f6feb;color:#fff}select,input[type=text],input[type=number]{background:#0d1117;border:1px solid #30363d;color:#e6e8eb;padding:6px;border-radius:6px;margin:2px}h2{font-size:17px;margin:16px 0 8px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.mono{font-family:monospace}.small{font-size:13px;color:#8b949e}.tag{display:inline-block;background:#161b22;border:1px solid #30363d;padding:2px 8px;border-radius:20px;font-size:12px;margin:2px}.head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap}</style></head>
 <body><div class="head"><h1>🔌 Lobe 一键开关</h1><button class="logout" onclick="window.location='/logout'">退出登录</button></div>
 <p>已验证：<b>${escapeHtml(AUTH_MODE === 'totp' ? '动态码' : (req.session.user ? req.session.user.login : ''))}</b></p>
-<div id="msg" style="margin:8px 0;font-weight:bold"></div>
+ <div id="msg" style="margin:8px 0;font-weight:bold"></div>
+
+<div class="card">
+<h2>🎛 OpenCode</h2>
+<div>
+<button class="mode-btn" onclick="window.open('/opencode-panel','_blank')">🎛 模式面板</button>
+<button class="mode-btn" onclick="window.open('/proto/doc-tree-strategy.html','_blank')">📐 原型展示</button>
+<button class="mode-btn" onclick="ocBackup()">💾 备份 opencode 库</button>
+</div>
+<div id="ocbk" class="small" style="margin-top:8px;color:#8b949e;word-break:break-all"></div>
+</div>
 
 <div class="card">
 <h2>🚦 资源与应用</h2>
@@ -770,7 +786,34 @@ const LOGIN_URL='${AUTH_MODE === 'totp' ? '/totp/verify' : '/auth/login'}';
 async function j(url,opts){const r=await fetch(url,opts);if(r.status===401){window.location=LOGIN_URL;return null;}return r.json();}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 
-async function load(){await loadStatus();await loadResources();await loadModes();await loadBackup();}
+async function load(){await loadStatus();await loadResources();await loadModes();await loadBackup();await loadOcBackup();}
+
+// OpenCode 备份：触发 + 日志状态
+async function loadOcBackup(){
+  const el=document.getElementById('ocbk');if(!el)return;
+  try{
+    const r=await fetch('/opencode/backup/log');
+    if(r.status===401){return;}
+    const d=await r.json().catch(()=>null);
+    if(!d){el.textContent='';return;}
+    const runHtml=d.running?'<span class="running">● 备份进行中…</span><br>':'';
+    const tail=(d.log||'').split('\n').filter(Boolean).slice(-4).map(esc).join('<br>');
+    el.innerHTML=runHtml+(tail||'暂无备份日志');
+  }catch(e){el.textContent='';}
+}
+async function ocBackup(){
+  const el=document.getElementById('ocbk');
+  if(!confirm('确认触发 opencode 数据库备份并上传 S3？（后台执行，可关闭本弹窗）'))return;
+  el.innerHTML='⏳ 备份触发中…';
+  try{
+    const r=await fetch('/opencode/backup',{method:'POST'});
+    const d=await r.json().catch(()=>null);
+    if(d&&d.ok&&d.started){el.innerHTML='<span class="ok">✅ 备份已启动（后台执行）</span>';}
+    else if(d&&d.busy){el.innerHTML='<span class="err">⏳ '+esc(d.busy)+'</span>';}
+    else{el.innerHTML='<span class="err">❌ 触发失败：'+esc((d&&d.error)||('HTTP '+r.status))+'</span>';}
+  }catch(e){el.innerHTML='<span class="err">❌ 请求失败</span>';}
+  setTimeout(loadOcBackup,2000);
+}
 async function loadStatus(){
 const s=await j('/status');if(!s)return;const list=document.getElementById('list');
 const apps=(s&&s.apps)||[];const anyErr=apps.length===0;
@@ -1188,17 +1231,17 @@ app.post('/resume', requireAuth, requireTotp, async (req, res) => {
   res.json({ ok: true });
 });
 
-/* ================= OC 面板/原型 门卫转发（2026-09-03 v3 定稿） ================= */
-// 原路径（含 query）整体透传至 OC_PANEL_TARGET（devbox 4900 内网小服务），不重写。
-// 复用 requireAuth + requireTotp：GitHub 登录 + TOTP 门卫在此生效（与其它受保护 API 同 gate）。
-// 纯 HTTP 面板/静态，无需 upgrade 透传；upstream 不可达 → 502。
-function forwardOcPanel(req, res) {
+/* ================= OC 面板/原型/备份 门卫转发（2026-09-03 v3 定稿 + 阶段7 增量） ================= */
+// 目标 OC_PANEL_TARGET（devbox 4900 内网小服务）；pathOverride 缺省 = req.originalUrl（原样透传）。
+// 复用 requireAuth + requireTotp：GitHub 登录 + TOTP 门卫在此生效。upstream 不可达 → 502。
+function ocForward(req, res, pathOverride, extraHeaders) {
   let u;
   try { u = new URL(OC_PANEL_TARGET); } catch (e) { return res.status(500).send('Bad OC_PANEL_UPSTREAM'); }
   const hop = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
     'te', 'trailers', 'transfer-encoding', 'upgrade', 'host'];
   const headers = {};
   Object.keys(req.headers).forEach((k) => { if (!hop.includes(k)) headers[k] = req.headers[k]; });
+  if (extraHeaders) Object.assign(headers, extraHeaders);
   headers.host = u.host;
   headers['x-forwarded-for'] = req.socket.remoteAddress || '';
   headers['x-forwarded-proto'] = 'https';
@@ -1207,7 +1250,7 @@ function forwardOcPanel(req, res) {
   const proxyReq = http.request({
     hostname: u.hostname,
     port: u.port || 80,
-    path: req.originalUrl || '/',
+    path: pathOverride || req.originalUrl || '/',
     method: req.method,
     headers,
   }, (proxyRes) => {
@@ -1222,7 +1265,49 @@ function forwardOcPanel(req, res) {
   req.pipe(proxyReq);
 }
 
+function forwardOcPanel(req, res) { return ocForward(req, res, null, null); }
+
 app.all(['/opencode-panel', '/opencode-panel/*', '/proto', '/proto/*'], requireAuth, requireTotp, forwardOcPanel);
+
+// 触发 opencode 库备份（带 S3 凭证头转发 4900 /panel/api/backup）
+function ocBackupHeaders() {
+  return { 'x-s3-key': OC_S3_ACCESS_KEY, 'x-s3-secret': OC_S3_SECRET_KEY };
+}
+app.post('/opencode/backup', requireAuth, requireTotp, (req, res) => {
+  if (!OC_S3_ACCESS_KEY || !OC_S3_SECRET_KEY) {
+    return res.status(503).json({ error: 'OC_S3_ACCESS_KEY / OC_S3_SECRET_KEY 未配置，无法备份 opencode 库' });
+  }
+  ocForward(req, res, '/panel/api/backup', ocBackupHeaders());
+});
+app.get('/opencode/backup/log', requireAuth, requireTotp, (req, res) => {
+  ocForward(req, res, '/panel/api/backup/log', null);
+});
+
+// 每日定时 opencode 备份：随 PG 备份时点触发，独立 try/catch 失败不阻塞 PG 备份
+async function triggerOcPanelBackup() {
+  if (!OC_S3_ACCESS_KEY || !OC_S3_SECRET_KEY) {
+    throw new Error('OC_S3 凭证未配置，跳过');
+  }
+  let u;
+  try { u = new URL(OC_PANEL_TARGET); } catch (e) { throw new Error('Bad OC_PANEL_UPSTREAM'); }
+  await new Promise((resolve) => {
+    const headers = ocBackupHeaders();
+    headers['Content-Length'] = '0';
+    const preq = http.request({
+      hostname: u.hostname, port: u.port || 80,
+      path: '/panel/api/backup', method: 'POST', headers,
+    }, (pres) => {
+      let body = '';
+      pres.on('data', (c) => { body += c; });
+      pres.on('end', () => {
+        console.log(`[oc-backup] 定时 opencode 备份触发: HTTP ${pres.statusCode} ${String(body).slice(0, 160)}`);
+        resolve();
+      });
+    });
+    preq.on('error', (e) => { console.error(`[oc-backup] 定时 opencode 备份失败: ${e.message}`); resolve(); });
+    preq.end();
+  });
+}
 
 /* ================= 启动 ================= */
 app.listen(PORT, () => {
