@@ -62,9 +62,27 @@ const TOTP_SECRET = unescapeEnvVal(process.env.TOTP_SECRET) || '';
 const AUTH_MODE = process.env.AUTH_MODE || 'both';
 // devbox 内网 opencode 面板/原型服务（4900）：/opencode-panel、/proto 门卫转发目标
 const OC_PANEL_TARGET = (process.env.OC_PANEL_UPSTREAM || 'http://my-devbox-qzuwpllzwwkz.ns-feotrwac.svc.cluster.local:4900').replace(/\/+$/, '');
-// opencode 库备份上传 S3 凭证（sealos env 注入；经 unescapeEnvVal 处理 # 转义）
-const OC_S3_ACCESS_KEY = unescapeEnvVal(process.env.OC_S3_ACCESS_KEY) || '';
-const OC_S3_SECRET_KEY = unescapeEnvVal(process.env.OC_S3_SECRET_KEY) || '';
+// opencode 库备份 S3 凭证：优先解析 S3_URI（MC_HOST 风格 https://AK:SK@endpoint，桶取 S3_BUCK），
+// 兼容旧 OC_S3_ACCESS_KEY / OC_S3_SECRET_KEY env（两者都缺则备份端点报 503）
+function parseS3Uri() {
+  const uri = unescapeEnvVal(process.env.S3_URI) || '';
+  // MC_HOST 约定：@ 后必是 endpoint（host 不含 @），故按最后一个 @ 切分；AK/SK 可能被 URL 编码
+  const m = uri.match(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^:/@]+):([^@]+)@(.+)$/);
+  if (!m) return null;
+  let ep = m[3].replace(/\/+$/, '');
+  if (!/^https?:\/\//.test(ep)) ep = 'http://' + ep;
+  try {
+    return { ak: decodeURIComponent(m[1]), sk: decodeURIComponent(m[2]), endpoint: ep };
+  } catch (e) {
+    return { ak: m[1], sk: m[2], endpoint: ep };
+  }
+}
+const OC_S3 = parseS3Uri() || {
+  ak: unescapeEnvVal(process.env.OC_S3_ACCESS_KEY) || '',
+  sk: unescapeEnvVal(process.env.OC_S3_SECRET_KEY) || '',
+  endpoint: '',
+};
+const OC_S3_BUCKET = unescapeEnvVal(process.env.S3_BUCK) || '';
 const KUBE_API_SERVER = (process.env.KUBE_API_SERVER || '').replace(/\/+$/, '');
 const KUBE_SA_TOKEN = unescapeEnvVal(process.env.KUBE_SA_TOKEN) || '';
 const KUBE_NAMESPACE = process.env.KUBE_NAMESPACE || 'default';
@@ -1269,13 +1287,16 @@ function forwardOcPanel(req, res) { return ocForward(req, res, null, null); }
 
 app.all(['/opencode-panel', '/opencode-panel/*', '/proto', '/proto/*'], requireAuth, requireTotp, forwardOcPanel);
 
-// 触发 opencode 库备份（带 S3 凭证头转发 4900 /panel/api/backup）
+// 触发 opencode 库备份（带 S3 凭证/端点/桶头转发 4900 /panel/api/backup）
 function ocBackupHeaders() {
-  return { 'x-s3-key': OC_S3_ACCESS_KEY, 'x-s3-secret': OC_S3_SECRET_KEY };
+  const h = { 'x-s3-key': OC_S3.ak, 'x-s3-secret': OC_S3.sk };
+  if (OC_S3.endpoint) h['x-s3-endpoint'] = OC_S3.endpoint;
+  if (OC_S3_BUCKET) h['x-s3-bucket'] = OC_S3_BUCKET;
+  return h;
 }
 app.post('/opencode/backup', requireAuth, requireTotp, (req, res) => {
-  if (!OC_S3_ACCESS_KEY || !OC_S3_SECRET_KEY) {
-    return res.status(503).json({ error: 'OC_S3_ACCESS_KEY / OC_S3_SECRET_KEY 未配置，无法备份 opencode 库' });
+  if (!OC_S3.ak || !OC_S3.sk) {
+    return res.status(503).json({ error: 'S3_URI（或 OC_S3_ACCESS_KEY/OC_S3_SECRET_KEY）未配置，无法备份 opencode 库' });
   }
   ocForward(req, res, '/panel/api/backup', ocBackupHeaders());
 });
@@ -1285,7 +1306,7 @@ app.get('/opencode/backup/log', requireAuth, requireTotp, (req, res) => {
 
 // 每日定时 opencode 备份：随 PG 备份时点触发，独立 try/catch 失败不阻塞 PG 备份
 async function triggerOcPanelBackup() {
-  if (!OC_S3_ACCESS_KEY || !OC_S3_SECRET_KEY) {
+  if (!OC_S3.ak || !OC_S3.sk) {
     throw new Error('OC_S3 凭证未配置，跳过');
   }
   let u;
